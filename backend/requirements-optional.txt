@@ -1,0 +1,15 @@
+# Optional extras. Install only what you need:
+#   pip install -r requirements-optional.txt
+# Each integration degrades gracefully when the dependency is missing.
+
+# Voice input (speech-to-text). Large download on first model use.
+faster-whisper>=1.0
+
+# Authorized media downloads / metadata (no DRM circumvention is implemented).
+yt-dlp>=2024.8.6
+
+# TTS fallback on the backend (Windows SAPI). The UI can also use Web Speech API.
+pyttsx3>=2.90
+
+# Voice activity detection helper for push-to-talk segmentation.
+numpy>=1.26

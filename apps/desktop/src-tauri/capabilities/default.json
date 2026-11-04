@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Narrow capability for the Mochi main window: core window/app events only. No shell, filesystem or HTTP plugin access is granted to the frontend.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="Mochi, the little AI companion">
+  <defs>
+    <linearGradient id="body" x1="52" y1="42" x2="150" y2="164" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="0.52" stop-color="#F3EDFF"/>
+      <stop offset="1" stop-color="#DCCEF8"/>
+    </linearGradient>
+    <linearGradient id="ear" x1="60" y1="30" x2="90" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E6DBFA"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="58%" r="50%">
+      <stop stop-color="#C9F1F1" stop-opacity="0.72"/>
+      <stop offset="0.65" stop-color="#E8DEFF" stop-opacity="0.4"/>
+      <stop offset="1" stop-color="#E8DEFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <ellipse cx="100" cy="118" rx="86" ry="76" fill="url(#glow)"/>
+  <ellipse cx="100" cy="178" rx="46" ry="8" fill="#B9A1E8" opacity="0.22"/>
+  <g transform="rotate(1.5 100 110)">
+    <path d="M55 64C43 48 43 31 57 33C70 35 79 49 80 65C72 68 63 68 55 64Z" fill="url(#ear)" stroke="#D8CAF2" stroke-width="2"/>
+    <path d="M59 57C52 48 52 40 58 41C65 42 70 50 71 58C67 59 63 59 59 57Z" fill="#FFDCE9" opacity="0.9"/>
+    <path d="M145 64C157 48 157 31 143 33C130 35 121 49 120 65C128 68 137 68 145 64Z" fill="url(#ear)" stroke="#D8CAF2" stroke-width="2"/>
+    <path d="M141 57C148 48 148 40 142 41C135 42 130 50 129 58C133 59 137 59 141 57Z" fill="#FFDCE9" opacity="0.9"/>
+    <path d="M96 45C92 31 99 21 110 17C115 28 111 39 104 47C101 48 98 47 96 45Z" fill="#F1E9FF" stroke="#D8CAF2" stroke-width="2"/>
+    <path d="M100 44C129 44 155 62 162 93C169 124 154 155 125 166C111 171 89 171 75 166C46 155 31 124 38 93C45 62 71 44 100 44Z" fill="url(#body)" stroke="#D8CAF2" stroke-width="2.4"/>
+    <ellipse cx="100" cy="140" rx="34" ry="20" fill="#FFFFFF" opacity="0.5"/>
+    <ellipse cx="58" cy="121" rx="13" ry="8" fill="#FFDCE9" opacity="0.75"/>
+    <ellipse cx="142" cy="121" rx="13" ry="8" fill="#FFDCE9" opacity="0.75"/>
+    <g>
+      <ellipse cx="77" cy="101" rx="9.5" ry="11.5" fill="#4E4562"/>
+      <circle cx="80" cy="96.5" r="3.1" fill="#FFFFFF"/>
+      <circle cx="74" cy="105" r="1.5" fill="#FFFFFF" opacity="0.65"/>
+      <ellipse cx="123" cy="101" rx="9.5" ry="11.5" fill="#4E4562"/>
+      <circle cx="126" cy="96.5" r="3.1" fill="#FFFFFF"/>
+      <circle cx="120" cy="105" r="1.5" fill="#FFFFFF" opacity="0.65"/>
+    </g>
+    <path d="M92 121C95 126 99 126 100 123C101 126 105 126 108 121" stroke="#4E4562" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+    <ellipse cx="76" cy="158" rx="11" ry="7" fill="#FFFFFF" opacity="0.85"/>
+    <ellipse cx="124" cy="158" rx="11" ry="7" fill="#FFFFFF" opacity="0.85"/>
+  </g>
+</svg>

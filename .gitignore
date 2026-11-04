@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# Mochi / JARVIS project
+# ---------------------------------------------------------------------------
+
+# --- Python backend -------------------------------------------------------
+backend/.venv/
+.venv/
+venv/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node / frontend ------------------------------------------------------
+node_modules/
+.pnpm-store/
+apps/desktop/dist/
+apps/desktop/dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Tauri / Rust ---------------------------------------------------------
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+**/*.rs.bk
+
+# --- Runtime data (local only, never committed) ---------------------------
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# --- Secrets / environment ------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+credentials.json
+secrets.json
+
+# --- Logs -----------------------------------------------------------------
+*.log
+logs/
+*.out.log
+*.err.log
+
+# --- OS / editor ----------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.sw?
+
+# --- Build / packaging artifacts -----------------------------------------
+*.msi
+*.exe
+*.nsis.zip
+release/
