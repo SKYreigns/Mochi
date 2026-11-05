@@ -7,6 +7,7 @@ import {
   Camera,
   Cpu,
   ExternalLink,
+  Eye,
   Globe,
   HardDrive,
   MemoryStick,
@@ -14,10 +15,19 @@ import {
   MousePointerClick,
   RefreshCw,
   Server,
+  ShieldAlert,
+  ShieldCheck,
   X,
 } from 'lucide-react'
 import { api, errorMessage } from '@/lib/api'
-import type { BrowserTab, DesktopWindows, SystemMetrics, SystemProcess } from '@/lib/types'
+import type {
+  BrowserTab,
+  ComputerEngineState,
+  ComputerUseObservation,
+  DesktopWindows,
+  SystemMetrics,
+  SystemProcess,
+} from '@/lib/types'
 import { useLiveStore } from '@/stores/live'
 import { toast } from '@/stores/toast'
 import { PageHeader } from '@/components/AppShell'
@@ -33,6 +43,9 @@ export function ComputerScreen() {
   const [browserBusy, setBrowserBusy] = useState(false)
   const [url, setUrl] = useState('')
   const [loading, setLoading] = useState(true)
+  const [engineState, setEngineState] = useState<ComputerEngineState | null>(null)
+  const [engineObservation, setEngineObservation] = useState<ComputerUseObservation | null>(null)
+  const [engineBusy, setEngineBusy] = useState(false)
 
   const live = useLiveStore((state) => state.live)
   const refreshLive = useLiveStore((state) => state.refresh)
@@ -64,8 +77,18 @@ export function ComputerScreen() {
       .liveState()
       .then(() => undefined)
       .catch(() => undefined)
+    const enginePromise = api
+      .computerState()
+      .then((value) => setEngineState(value))
+      .catch(() => undefined)
 
-    await Promise.allSettled([metricsPromise, processPromise, windowsPromise, livePromise])
+    await Promise.allSettled([
+      metricsPromise,
+      processPromise,
+      windowsPromise,
+      livePromise,
+      enginePromise,
+    ])
     setLoading(false)
   }, [])
 
@@ -120,6 +143,24 @@ export function ComputerScreen() {
       toast.error('Could not capture the browser', errorMessage(error))
     } finally {
       setBrowserBusy(false)
+    }
+  }
+
+  const observeDesktop = async () => {
+    setEngineBusy(true)
+    try {
+      const result = await api.computerObserve({
+        includeElements: true,
+        includeScreenshot: true,
+      })
+      setEngineObservation(result.observation)
+      const state = await api.computerState()
+      setEngineState(state)
+      toast.success('Desktop observed with UI Automation')
+    } catch (error) {
+      toast.error('Could not observe the desktop', errorMessage(error))
+    } finally {
+      setEngineBusy(false)
     }
   }
 
@@ -235,6 +276,135 @@ export function ComputerScreen() {
                   ))}
                 </div>
               </div>
+            )}
+          </Card>
+
+          <Card className="p-5">
+            <SectionHeading
+              title="Computer use engine"
+              description="Observe → act → observe again → verify. Screen text is untrusted data, never instructions."
+              action={
+                <Badge tone={engineState?.emergency.stopped ? 'danger' : 'success'} dot>
+                  {!engineState ? 'Checking…' : engineState.emergency.stopped ? 'STOP engaged' : 'Ready'}
+                </Badge>
+              }
+            />
+            {!engineState ? (
+              <Skeleton className="mt-3 h-28" />
+            ) : (
+              <>
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  <Badge tone="neutral">{engineState.engine}</Badge>
+                  <Badge tone="accent">{engineState.permission_mode}</Badge>
+                  {Object.entries(engineState.capabilities).map(([name, available]) => (
+                    <Badge key={name} tone={available ? 'success' : 'neutral'}>
+                      {name}
+                    </Badge>
+                  ))}
+                </div>
+
+                {engineState.emergency.stopped && (
+                  <div className="mt-3 rounded-2xl border border-danger/25 bg-danger-soft/50 p-3 text-danger">
+                    <p className="flex items-center gap-1.5 text-xs font-extrabold">
+                      <ShieldAlert className="size-3.5" aria-hidden /> Computer actions are paused
+                    </p>
+                    <p className="mt-1 text-[11px] leading-relaxed">
+                      Every new input action is blocked until you explicitly resume from Settings or Live Activity.
+                      {engineState.emergency.reason ? ` Reason: ${engineState.emergency.reason}` : ''}
+                    </p>
+                  </div>
+                )}
+
+                <div className="mt-3 rounded-2xl border border-line bg-surface-muted/40 p-3">
+                  <div className="flex items-center gap-2">
+                    <Badge tone={engineState.activity.status === 'failed' ? 'danger' : 'neutral'}>
+                      {statusLabel(engineState.activity.status)}
+                    </Badge>
+                    <p className="font-mono text-[10px] text-ink-faint">
+                      {engineState.activity.action ?? 'idle'}
+                    </p>
+                  </div>
+                  <p className="mt-1.5 text-xs text-ink-soft">
+                    {engineState.activity.detail || 'No computer action recorded yet.'}
+                  </p>
+                  {engineState.last_error && (
+                    <p className="mt-1 text-[11px] font-semibold text-danger">{engineState.last_error}</p>
+                  )}
+                </div>
+
+                <div className="mt-2 rounded-2xl border border-line bg-surface-muted/40 p-3">
+                  <div className="flex items-center gap-2">
+                    {engineState.last_verification?.verified ? (
+                      <ShieldCheck className="size-3.5 text-success" aria-hidden />
+                    ) : (
+                      <ShieldAlert className="size-3.5 text-warning" aria-hidden />
+                    )}
+                    <p className="text-xs font-extrabold text-ink">
+                      {engineState.last_verification
+                        ? engineState.last_verification.verified
+                          ? 'Last action verified'
+                          : 'Last action unverified'
+                        : 'No verification yet'}
+                    </p>
+                    {engineState.last_verification?.method && (
+                      <Badge tone="neutral">{engineState.last_verification.method}</Badge>
+                    )}
+                  </div>
+                  <p className="mt-1 text-[11px] leading-relaxed text-ink-soft">
+                    {engineState.last_verification?.detail ||
+                      'Only a fresh observation can establish that an action worked.'}
+                  </p>
+                  {engineState.last_verification?.evidence && (
+                    <p className="mt-1 break-words text-[10px] text-ink-faint">
+                      {engineState.last_verification.evidence}
+                    </p>
+                  )}
+                </div>
+
+                <div className="mt-2 rounded-2xl border border-line bg-surface-muted/40 p-3">
+                  <div className="flex items-center gap-2">
+                    <Eye className="size-3.5 text-accent" aria-hidden />
+                    <p className="text-xs font-extrabold text-ink">Desktop observation</p>
+                  </div>
+                  <p className="mt-1 text-[11px] text-ink-soft">
+                    {(engineObservation?.active_window?.title ??
+                      engineState.last_observation?.active_window ??
+                      'No active window')}
+                  </p>
+                  <p className="mt-0.5 text-[10px] text-ink-faint">
+                    {engineObservation
+                      ? `${engineObservation.window_count ?? 0} windows · ${engineObservation.element_count ?? 0} UI elements`
+                      : engineState.last_observation
+                        ? `${engineState.last_observation.window_count ?? 0} windows · ${engineState.last_observation.element_count ?? 0} UI elements`
+                        : 'Observe the desktop to capture fresh evidence.'}
+                    {engineObservation?.detection_sources?.length
+                      ? ` · ${engineObservation.detection_sources.join(', ')}`
+                      : ''}
+                  </p>
+                  {engineObservation?.warnings && engineObservation.warnings.length > 0 && (
+                    <p className="mt-1 text-[10px] text-warning">{engineObservation.warnings.join(' ')}</p>
+                  )}
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="soft"
+                      onClick={() => void observeDesktop()}
+                      loading={engineBusy}
+                      icon={<Eye className="size-3.5" aria-hidden />}
+                    >
+                      Observe desktop
+                    </Button>
+                    {engineState.activity.task_id && (
+                      <Link
+                        to="/activity"
+                        className="text-[11px] font-extrabold text-accent-strong hover:underline"
+                      >
+                        Follow in Live Activity →
+                      </Link>
+                    )}
+                  </div>
+                </div>
+              </>
             )}
           </Card>
 

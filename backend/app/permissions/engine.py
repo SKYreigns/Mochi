@@ -31,27 +31,61 @@ class PermissionedTool(Protocol):
 
 
 class EmergencyState:
-    """Global kill switch shared by every running task."""
+    """Global kill switch shared by every running task.
+
+    The in-memory flag is authoritative for fast checks during execution. The
+    task service persists the same record so a STOP survives a process restart;
+    until that persisted record has been reconciled, startup treats the state as
+    fail-safe (see ``TaskService.reconcile_emergency_state``).
+    """
 
     def __init__(self) -> None:
         self._stopped = False
         self.stopped_at: datetime | None = None
+        self.reason: str = ""
+        self.generation = 0
 
     @property
     def stopped(self) -> bool:
         return self._stopped
 
-    def engage(self) -> None:
+    def engage(self, reason: str = "") -> None:
         self._stopped = True
         self.stopped_at = datetime.now(timezone.utc)
+        self.reason = reason
+        self.generation += 1
 
     def clear(self) -> None:
         self._stopped = False
         self.stopped_at = None
+        self.reason = ""
+        self.generation += 1
+
+    def restore(
+        self,
+        *,
+        stopped: bool,
+        stopped_at: datetime | None = None,
+        reason: str = "",
+    ) -> None:
+        self._stopped = stopped
+        self.stopped_at = stopped_at if stopped else None
+        self.reason = reason if stopped else ""
+        self.generation += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "stopped": self._stopped,
+            "stopped_at": self.stopped_at.isoformat() if self.stopped_at else None,
+            "reason": self.reason,
+            "generation": self.generation,
+        }
 
     def check(self) -> None:
         if self._stopped:
-            raise EmergencyStopError("Emergency stop is engaged. All autonomous execution is halted.")
+            raise EmergencyStopError(
+                "Emergency stop is engaged. All autonomous execution is halted."
+            )
 
 
 @dataclass(slots=True)
@@ -234,6 +268,9 @@ class PermissionEngine:
         approved: bool,
         note: str = "",
     ) -> Approval:
+        # A STOP invalidates every pending authorization: the user must resume
+        # explicitly before a previously requested action can be approved.
+        self.emergency.check()
         approval = await session.get(Approval, approval_id)
         if approval is None:
             raise PermissionDeniedError("Approval request not found.")
@@ -310,6 +347,43 @@ class PermissionEngine:
             if not waiter.done():
                 waiter.cancel()
         self._waiters.clear()
+
+    async def reject_pending_approvals(
+        self,
+        session: AsyncSession,
+        *,
+        reason: str,
+    ) -> int:
+        """Cancel every pending approval and wake up blocked tasks.
+
+        Used by the emergency STOP path. ``cancel_task_approvals`` only covers a
+        single task; a STOP must reject approvals for every task at once.
+        """
+        approvals = (
+            await session.execute(select(Approval).where(Approval.status == "pending"))
+        ).scalars().all()
+        now = datetime.now(timezone.utc)
+        for approval in approvals:
+            approval.status = "cancelled"
+            approval.decision_note = reason
+            approval.decided_at = now
+            session.add(
+                AuditLog(
+                    event="approval.cancelled",
+                    actor="system",
+                    action=approval.tool_name,
+                    target=str(redact_value(approval.arguments))[:400],
+                    outcome="cancelled",
+                    detail={"approval_id": approval.id, "reason": reason},
+                    task_id=approval.task_id,
+                )
+            )
+            waiter = self._waiters.pop(approval.id, None)
+            if waiter and not waiter.done():
+                waiter.cancel()
+        if approvals:
+            await session.commit()
+        return len(approvals)
 
     async def mark_stale_approvals(self, session: AsyncSession) -> int:
         approvals = (

@@ -226,10 +226,48 @@ async def chat_task(task_id: str, request: Request) -> dict[str, Any]:
 
 
 # --- WebSocket event stream ------------------------------------------------
+def _event_matches_scope(
+    event: dict[str, Any],
+    *,
+    task_id: str | None,
+    conversation_id: str | None,
+    conversation_tasks: set[str],
+) -> bool:
+    """Task/conversation isolation for the live event stream."""
+    if not task_id and not conversation_id:
+        return True
+    payload = event.get("payload") or {}
+    if not isinstance(payload, dict):
+        return False
+    event_task = payload.get("task_id")
+    event_conversation = payload.get("conversation_id")
+    if task_id and event_task == task_id:
+        return True
+    if conversation_id:
+        if event_conversation == conversation_id:
+            if isinstance(event_task, str):
+                conversation_tasks.add(event_task)
+            return True
+        if isinstance(event_task, str) and event_task in conversation_tasks:
+            return True
+    return False
+
+
 @ws_router.websocket("/ws/events")
 async def events_socket(websocket: WebSocket) -> None:
     await websocket.accept()
     services = websocket.app.state.services
+    task_id = (websocket.query_params.get("task_id") or "").strip() or None
+    conversation_id = (websocket.query_params.get("conversation_id") or "").strip() or None
+    conversation_tasks: set[str] = set()
+    if conversation_id and not task_id:
+        async with services.db.session() as session:
+            rows = (
+                await session.execute(
+                    select(Task.id).where(Task.conversation_id == conversation_id)
+                )
+            ).scalars().all()
+            conversation_tasks.update(str(row) for row in rows)
     queue = services.events.subscribe()
     disconnected = asyncio.Event()
 
@@ -246,9 +284,23 @@ async def events_socket(websocket: WebSocket) -> None:
 
     watcher = asyncio.create_task(watch_disconnect(), name="ws-watch")
     try:
-        await websocket.send_json({"type": "hello", "payload": services.snapshot()})
+        await websocket.send_json(
+            {
+                "type": "hello",
+                "payload": {
+                    **services.snapshot(),
+                    "scope": {"task_id": task_id, "conversation_id": conversation_id},
+                },
+            }
+        )
         for event in services.events.history(80):
-            await websocket.send_json(event)
+            if _event_matches_scope(
+                event,
+                task_id=task_id,
+                conversation_id=conversation_id,
+                conversation_tasks=conversation_tasks,
+            ):
+                await websocket.send_json(event)
         while not disconnected.is_set():
             getter = asyncio.create_task(queue.get(), name="ws-event-get")
             closer = asyncio.create_task(disconnected.wait(), name="ws-closed-wait")
@@ -263,7 +315,15 @@ async def events_socket(websocket: WebSocket) -> None:
             if getter not in done:
                 await websocket.send_json({"type": "ping", "payload": {}})
                 continue
-            await websocket.send_json(getter.result())
+            event = getter.result()
+            if not _event_matches_scope(
+                event,
+                task_id=task_id,
+                conversation_id=conversation_id,
+                conversation_tasks=conversation_tasks,
+            ):
+                continue
+            await websocket.send_json(event)
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:

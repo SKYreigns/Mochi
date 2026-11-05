@@ -5,6 +5,8 @@ import type {
   BrowserState,
   ChatMessage,
   ChatSendResult,
+  ComputerEngineState,
+  ComputerUseObservation,
   Conversation,
   DesktopWindows,
   DirectoryListing,
@@ -374,6 +376,16 @@ export const api = {
     ),
 
   liveState: () => request<LiveState>('/api/live/state'),
+  computerState: () => request<ComputerEngineState>('/api/computer/state'),
+  computerObserve: (options: { includeElements?: boolean; includeOcr?: boolean; includeScreenshot?: boolean } = {}) =>
+    request<{ observation: ComputerUseObservation }>(
+      `/api/computer/observe${query({
+        include_elements: options.includeElements ?? true,
+        include_ocr: options.includeOcr ?? false,
+        include_screenshot: options.includeScreenshot ?? true,
+      })}`,
+      { timeoutMs: 30_000 },
+    ),
   desktopWindows: () => request<DesktopWindows>('/api/system/windows', { timeoutMs: 20_000 }),
   captureScreenshot: () =>
     request<{ data: Record<string, unknown>; evidence: string }>('/api/live/screenshot', {

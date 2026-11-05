@@ -12,6 +12,8 @@ from app.core.config import Settings
 from app.core.events import EventBus
 from app.core.logging import get_logger, setup_logging
 from app.core.security import PathPolicy
+from app.computer import ComputerUseEngine
+from app.computer.tools import register_computer_tools
 from app.database.database import Database
 from app.database.models import Workflow
 from app.memory.manager import MemoryManager
@@ -97,12 +99,14 @@ class AppServices:
         self.provider_manager = ProviderManager(app_settings, self.settings)
         self.browser = BrowserManager(app_settings, self.events)
         self.desktop = DesktopManager(app_settings, self.events)
+        self.computer = ComputerUseEngine(self)
         self.lms = LmsService(self.settings, self.browser)
         self.voice = VoiceService(app_settings, self.settings)
 
         self.registry = ToolRegistry()
         register_browser_tools(self.registry)
         register_desktop_tools(self.registry)
+        register_computer_tools(self.registry)
         register_filesystem_tools(self.registry)
         register_document_tools(self.registry)
         register_system_tools(self.registry)
@@ -135,6 +139,9 @@ class AppServices:
                     steps=BUILTIN_WORKFLOW["steps"],
                 )
                 log.info("Seeded built-in workflow")
+        # Fail-safe reconciliation after recovery: a persisted STOP survives,
+        # interrupted work forces STOP, and only an explicit resume clears it.
+        await self.tasks.reconcile_emergency_state(stale_approvals=bool(cancelled))
         self.refresh_security()
         await self.scheduler.start()
         self._started = True
@@ -169,6 +176,7 @@ class AppServices:
         return {
             "permission_mode": self.settings.permission_mode,
             "emergency_stopped": self.emergency.stopped,
+            "emergency": self.emergency.snapshot(),
             "running_tasks": self.tasks.running_ids(),
             "browser_running": self.browser.is_running,
             "tools": len(self.registry.all()),

@@ -24,8 +24,9 @@ from app.core.errors import (
 from app.core.logging import audit, get_logger, redact, redact_payload, redact_value
 from app.database.models import Approval, AuditLog, Message, Task, TaskStep, ToolExecution
 from app.memory.manager import MemoryManager
-from app.orchestrator.planner import create_plan
+from app.orchestrator.planner import create_plan, record_plan_execution, summarize_plan
 from app.orchestrator.prompts import system_prompt
+from app.orchestrator.validation import validate_completion
 from app.providers.base import ChatMessage, LLMProvider, ToolCall
 from app.tools.base import ToolContext, ToolResult, ToolRegistry, fail
 
@@ -89,6 +90,7 @@ class AgentOrchestrator:
         executions: list[dict[str, Any]] = []
         final_content = ""
         status = TaskStatus.COMPLETED
+        plan: dict[str, Any] = {"objective": instruction, "steps": [], "source": "unset"}
 
         try:
             self.permissions.emergency.check()
@@ -109,6 +111,7 @@ class AgentOrchestrator:
             statistics["planner_ms"] = round((time.perf_counter() - planner_started) * 1000, 1)
             statistics["plan_steps"] = len(plan.get("steps", []))
             statistics["plan_source"] = plan.get("source", "model")
+            statistics["plan_validation"] = plan.get("validation", {})
             statistics["history_messages"] = len(history)
             task.objective = plan["objective"]
             task.plan = plan["steps"]
@@ -155,6 +158,7 @@ class AgentOrchestrator:
             step_index = 0
             no_progress_signature: str | None = None
             no_progress_repeats = 0
+            completion_issue = ""
 
             for iteration in range(app_settings.max_steps):
                 self.permissions.emergency.check()
@@ -221,10 +225,44 @@ class AgentOrchestrator:
                             task_id,
                         )
 
-                if response.content.strip():
-                    await self._store_assistant_message(session, conversation_id, response.content, task_id)
+                if not response.tool_calls and response.content.strip():
+                    validation = validate_completion(response.content, executions)
+                    statistics["completion_validation"] = {
+                        "ok": validation.ok,
+                        "claimed_categories": validation.claim_categories,
+                        "executed_categories": validation.executed_categories,
+                        "caveats": validation.caveats,
+                    }
+                    if not validation.ok:
+                        completion_issue = validation.issue
+                        content_to_store = validation.corrected_content
+                        audit(
+                            "completion.rejected",
+                            task_id=task_id,
+                            issue=validation.issue,
+                            claimed=validation.claim_categories,
+                        )
+                        await self.events.publish(
+                            "completion.rejected",
+                            {
+                                "task_id": task_id,
+                                "conversation_id": conversation_id,
+                                "issue": validation.issue,
+                                "claimed_categories": validation.claim_categories,
+                                "executed_categories": validation.executed_categories,
+                            },
+                        )
+                    else:
+                        content_to_store = response.content
+                        if validation.caveats:
+                            content_to_store = response.content.rstrip() + validation.caveat_text()
+                else:
+                    content_to_store = response.content
+
+                if content_to_store.strip():
+                    await self._store_assistant_message(session, conversation_id, content_to_store, task_id)
                     await self.events.publish(
-                        "llm.completed", {"task_id": task_id, "content": redact(response.content, 20000)}
+                        "llm.completed", {"task_id": task_id, "content": redact(content_to_store, 20000)}
                     )
 
                 assistant_message = ChatMessage(
@@ -235,7 +273,7 @@ class AgentOrchestrator:
                 messages.append(assistant_message)
 
                 if not response.tool_calls:
-                    final_content = response.content.strip()
+                    final_content = content_to_store.strip()
                     break
 
                 for call in response.tool_calls:
@@ -299,6 +337,7 @@ class AgentOrchestrator:
                         )
                         statistics["tools"] += 1
                         statistics["failed"] += 1
+                        record_plan_execution(plan, call.name, ok=False, verified=False)
                         executions.append(
                             {
                                 "id": execution.id,
@@ -432,6 +471,10 @@ class AgentOrchestrator:
                             step.status = "failed"
                     statistics["tools"] += 1
 
+                    record_plan_execution(
+                        plan, call.name, ok=result.ok, verified=result.verified
+                    )
+
                     record = {
                         "id": execution.id,
                         "index": step_index,
@@ -518,6 +561,14 @@ class AgentOrchestrator:
                 final_content = ""
                 task.error = f"Reached the maximum of {app_settings.max_steps} steps without completing the objective."
 
+            statistics["plan"] = summarize_plan(plan)
+            task.plan = plan["steps"]
+
+            if status == TaskStatus.COMPLETED and completion_issue:
+                status = TaskStatus.FAILED
+                final_content = ""
+                task.error = completion_issue
+
             # Never report success when a required action failed, even if the
             # model's final text claims otherwise. An execution record only stays
             # failed when retries were exhausted or authorization was refused.
@@ -587,6 +638,7 @@ class AgentOrchestrator:
                 conversation_id=conversation_id,
                 executions=executions,
                 statistics=statistics,
+                plan_steps=plan.get("steps"),
             )
         except Exception as exc:  # noqa: BLE001 - top-level agent safety net
             log.exception("Task %s crashed", task_id)
@@ -598,6 +650,7 @@ class AgentOrchestrator:
                 conversation_id=conversation_id,
                 executions=executions,
                 statistics=statistics,
+                plan_steps=plan.get("steps"),
             )
         finally:
             await self.events.publish("agent.idle", {"task_id": task_id})
@@ -622,6 +675,7 @@ class AgentOrchestrator:
         result: ToolResult
         max_retries = self.services.settings.app.max_retries
         while True:
+            self.permissions.emergency.check()
             result, duration = await self.registry.execute(call.name, call.arguments, ctx)
             attempts += 1
             total_duration += duration
@@ -799,6 +853,7 @@ class AgentOrchestrator:
         hint: str = "",
         executions: list[dict[str, Any]] | None = None,
         statistics: dict[str, Any] | None = None,
+        plan_steps: list[dict[str, Any]] | None = None,
     ) -> None:
         try:
             await session.rollback()
@@ -807,6 +862,8 @@ class AgentOrchestrator:
                 task.status = status.value
                 task.error = redact(error, 5000)
                 task.completed_at = datetime.now(timezone.utc)
+                if plan_steps is not None:
+                    task.plan = plan_steps
                 report = f"Task {status.value}: {error}"
                 if hint:
                     report += f"\n\nHint: {hint}"

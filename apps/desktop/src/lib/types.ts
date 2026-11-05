@@ -355,6 +355,67 @@ export interface DesktopWindows {
   count: number
 }
 
+export interface ComputerObservation {
+  timestamp?: string
+  active_window?: string | null
+  active_monitor?: number
+  window_count?: number
+  element_count?: number
+  detection_sources?: string[]
+  screenshot?: string | null
+  warnings?: string[]
+  duration_ms?: number
+}
+
+export interface ComputerVerification {
+  verified: boolean
+  method?: string
+  detail?: string
+  evidence?: string
+  timestamp?: string
+}
+
+export interface ComputerEngineState {
+  timestamp: string
+  engine: string
+  capabilities: Record<string, boolean>
+  permission_mode: PermissionMode
+  emergency: {
+    stopped: boolean
+    stopped_at?: string | null
+    reason?: string
+    generation?: number
+  }
+  active_window: Partial<DesktopWindow> & { error?: string }
+  screen: { monitors?: unknown[]; count?: number; primary?: number }
+  activity: {
+    status: string
+    action: string | null
+    task_id: string | null
+    conversation_id: string | null
+    started_at: string | null
+    finished_at: string | null
+    detail: string
+  }
+  last_observation: ComputerObservation | null
+  last_verification: ComputerVerification | null
+  last_error: string | null
+}
+
+export interface ComputerUseObservation {
+  timestamp?: string
+  active_window?: { title?: string; handle?: number; process?: string; pid?: number; rect?: DesktopWindow['rect'] }
+  active_monitor?: number
+  window_count?: number
+  element_count?: number
+  detection_sources?: string[]
+  screenshot?: { url?: string; path?: string; size?: number } | null
+  warnings?: string[]
+  duration_ms?: number
+  untrusted?: boolean
+}
+
+
 export interface LiveState {
   browser: BrowserState
   active_task: {

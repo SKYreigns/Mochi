@@ -12,10 +12,12 @@ from app.core.enums import TaskStatus
 from app.core.events import EventBus
 from app.core.logging import audit, get_logger
 from app.database.database import Database
-from app.database.models import Conversation, Message, Task, ToolExecution
+from app.database.models import ApplicationSetting, AuditLog, Conversation, Message, Task, ToolExecution
 from app.orchestrator.agent import AgentOrchestrator
 
 log = get_logger("tasks")
+
+_EMERGENCY_KEY = "safety.emergency"
 
 _TERMINAL = {
     TaskStatus.COMPLETED.value,
@@ -201,18 +203,129 @@ class TaskService:
         await self.services.permissions.cancel_all_waiters()
         return len(task_ids)
 
-    async def emergency_stop(self) -> dict[str, Any]:
-        self.services.emergency.engage()
+    async def emergency_stop(self, reason: str = "Emergency stop requested by the user.") -> dict[str, Any]:
+        self.services.emergency.engage(reason)
         cancelled = await self.cancel_all()
-        await self.events.publish("emergency.stop", {"cancelled_tasks": cancelled})
-        audit("emergency.stop", cancelled_tasks=cancelled)
-        return {"stopped": True, "cancelled_tasks": cancelled}
+        async with self.db.session() as session:
+            await self.services.permissions.reject_pending_approvals(session, reason="emergency stop")
+            await self._write_emergency_record(
+                session,
+                stopped=True,
+                stopped_at=self.services.emergency.stopped_at,
+                reason=reason,
+                actor="user",
+                event="emergency.stop",
+            )
+        await self.events.publish(
+            "emergency.stop",
+            {"cancelled_tasks": cancelled, "stopped_at": self.services.emergency.stopped_at.isoformat() if self.services.emergency.stopped_at else None, "reason": reason},
+        )
+        audit("emergency.stop", cancelled_tasks=cancelled, reason=reason)
+        return {"stopped": True, "cancelled_tasks": cancelled, "reason": reason}
 
-    async def resume(self) -> dict[str, Any]:
+    async def resume(self, reason: str = "Explicit user resume.") -> dict[str, Any]:
         self.services.emergency.clear()
-        await self.events.publish("emergency.cleared", {})
-        audit("emergency.cleared")
-        return {"stopped": False}
+        async with self.db.session() as session:
+            await self._write_emergency_record(
+                session,
+                stopped=False,
+                stopped_at=None,
+                reason=reason,
+                actor="user",
+                event="emergency.cleared",
+            )
+        await self.events.publish("emergency.cleared", {"reason": reason})
+        audit("emergency.cleared", reason=reason)
+        return {"stopped": False, "reason": reason}
+
+    async def _write_emergency_record(
+        self,
+        session: Any,
+        *,
+        stopped: bool,
+        stopped_at: datetime | None,
+        reason: str,
+        actor: str,
+        event: str,
+    ) -> None:
+        record = {
+            "stopped": stopped,
+            "stopped_at": stopped_at.isoformat() if stopped_at else None,
+            "reason": reason,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        row = await session.get(ApplicationSetting, _EMERGENCY_KEY)
+        previous = dict(row.value) if row is not None and isinstance(row.value, dict) else None
+        if row is None:
+            session.add(ApplicationSetting(key=_EMERGENCY_KEY, value=record))
+        else:
+            row.value = record
+        # Do not duplicate an identical activation when startup reconciliation
+        # re-persists the state written by stale-task recovery.
+        changed = previous is None or previous.get("stopped") != stopped or previous.get("reason") != reason
+        if changed:
+            session.add(
+                AuditLog(
+                    event=event,
+                    actor=actor,
+                    action="emergency_stop",
+                    target=reason[:400],
+                    outcome="stopped" if stopped else "resumed",
+                    detail=record,
+                )
+            )
+        await session.commit()
+
+    async def reconcile_emergency_state(self, *, stale_approvals: bool = False) -> dict[str, Any]:
+        """Restore the persisted STOP flag, defaulting to fail-safe on recovery.
+
+        * A STOP written by stale-task/execution recovery stays active.
+        * A freshly cancelled stale approval also forces STOP so an interrupted
+          operation can never resume silently after a restart.
+        * Otherwise the persisted record is restored exactly; a missing record
+          on a fresh database means "not stopped".
+        """
+        async with self.db.session() as session:
+            if self.services.emergency.stopped:
+                reason = self.services.emergency.reason or "Persisted emergency stop."
+                await self._write_emergency_record(
+                    session,
+                    stopped=True,
+                    stopped_at=self.services.emergency.stopped_at,
+                    reason=reason,
+                    actor="system",
+                    event="emergency.stop",
+                )
+                return self.services.emergency.snapshot()
+
+            if stale_approvals:
+                reason = "Backend restarted with interrupted approvals; explicit resume is required."
+                self.services.emergency.engage(reason)
+                await self._write_emergency_record(
+                    session,
+                    stopped=True,
+                    stopped_at=self.services.emergency.stopped_at,
+                    reason=reason,
+                    actor="system",
+                    event="emergency.stop",
+                )
+                await self.events.publish("emergency.stop", {"cancelled_tasks": 0, "reason": reason})
+                return self.services.emergency.snapshot()
+
+            row = await session.get(ApplicationSetting, _EMERGENCY_KEY)
+            record = row.value if row is not None and isinstance(row.value, dict) else None
+            if record and record.get("stopped"):
+                stopped_at = _parse_datetime(record.get("stopped_at"))
+                reason = str(record.get("reason") or "Persisted emergency stop.")
+                self.services.emergency.restore(stopped=True, stopped_at=stopped_at, reason=reason)
+                log.warning("Restored persisted emergency STOP: %s", reason)
+                await self.events.publish(
+                    "emergency.restored",
+                    {"reason": reason, "stopped_at": stopped_at.isoformat() if stopped_at else None},
+                )
+            else:
+                self.services.emergency.restore(stopped=False)
+            return self.services.emergency.snapshot()
 
     def running_ids(self) -> list[str]:
         return [task_id for task_id, worker in self._running.items() if not worker.done()]
@@ -252,8 +365,29 @@ class TaskService:
                 execution.error = execution.error or message
             await session.commit()
             if tasks or executions:
-                log.info(
-                    "Recovered %d task(s) and %d execution(s) after restart",
+                reason = (
+                    "Backend restarted while tasks or actions were still open. "
+                    "Execution stays halted until the user explicitly resumes."
+                )
+                self.services.emergency.engage(reason)
+                await self._write_emergency_record(
+                    session,
+                    stopped=True,
+                    stopped_at=self.services.emergency.stopped_at,
+                    reason=reason,
+                    actor="system",
+                    event="emergency.stop",
+                )
+                await self.events.publish(
+                    "emergency.stop",
+                    {
+                        "cancelled_tasks": len(tasks),
+                        "interrupted_executions": len(executions),
+                        "reason": reason,
+                    },
+                )
+                log.warning(
+                    "Recovered %d task(s) and %d execution(s) after restart; emergency STOP engaged",
                     len(tasks),
                     len(executions),
                 )
@@ -271,3 +405,15 @@ class TaskService:
             except Exception:
                 pass
         self._running.clear()
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed

@@ -115,21 +115,72 @@ class DesktopManager:
 
     def focus_window(self, window_name: str) -> dict[str, Any]:
         try:
-            from pywinauto import Desktop
+            import win32api
+            import win32con
+            import win32gui
+            import win32process
         except ImportError as exc:
-            raise ToolExecutionError("pywinauto is required to focus windows.", hint="pip install pywinauto") from exc
+            raise ToolExecutionError("pywin32 is required to focus windows.", hint="pip install pywin32") from exc
+
+        needle = window_name.strip().lower()
+        if not needle:
+            raise ToolExecutionError("Window name is empty.")
+
+        matches: list[tuple[int, str]] = []
+
+        def collect(hwnd: int, _: Any) -> None:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            title = win32gui.GetWindowText(hwnd)
+            if needle in title.lower():
+                matches.append((hwnd, title))
+
+        win32gui.EnumWindows(collect, None)
+        if not matches:
+            raise ToolExecutionError(
+                f"No visible window title contains '{window_name}'.",
+                hint="Call desktop.list_windows to get the exact title first.",
+            )
+        exact = [item for item in matches if needle == item[1].lower()]
+        hwnd, title = exact[0] if exact else matches[0]
+
         try:
-            window = Desktop(backend="uia").window(title_re=f".*{window_name}.*")
-            window.wait("exists ready", timeout=8)
-            window.set_focus()
-            time.sleep(0.4)
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.2)
+
+            current_thread = win32api.GetCurrentThreadId()
+            foreground = win32gui.GetForegroundWindow()
+            foreground_thread, _ = win32process.GetWindowThreadProcessId(foreground)
+            target_thread, _ = win32process.GetWindowThreadProcessId(hwnd)
+            attached_foreground = False
+            attached_target = False
+            try:
+                if foreground_thread and foreground_thread != current_thread:
+                    attached_foreground = bool(
+                        win32process.AttachThreadInput(current_thread, foreground_thread, True)
+                    )
+                if target_thread and target_thread != current_thread:
+                    attached_target = bool(
+                        win32process.AttachThreadInput(current_thread, target_thread, True)
+                    )
+                win32gui.BringWindowToTop(hwnd)
+                win32gui.SetForegroundWindow(hwnd)
+                win32gui.SetFocus(hwnd)
+            finally:
+                if attached_target:
+                    win32process.AttachThreadInput(current_thread, target_thread, False)
+                if attached_foreground:
+                    win32process.AttachThreadInput(current_thread, foreground_thread, False)
+            time.sleep(0.35)
         except Exception as exc:
             raise ToolExecutionError(
                 f"Could not focus a window matching '{window_name}': {exc}",
                 hint="Call desktop.list_windows to get the exact title first.",
             ) from exc
+
         active = self.active_window()
-        if window_name.lower() not in active.get("title", "").lower():
+        if needle not in active.get("title", "").lower():
             return {"requested": window_name, "active": active, "focused": False}
         return {"requested": window_name, "active": active, "focused": True}
 
@@ -270,7 +321,14 @@ class DesktopManager:
                 monitor = 0
             region = monitors[monitor]
             shot = capture.grab(region)
-            shot.save(str(target))
+            try:
+                shot.save(str(target))
+            except AttributeError:
+                # mss 10.2 removed ScreenShot.save in some builds; encode the
+                # raw RGB buffer explicitly instead of silently failing.
+                from mss.tools import to_png
+
+                to_png(shot.rgb, shot.size, output=str(target))
         return {
             "path": str(target),
             "url": f"/api/live/screenshots/{filename}",
