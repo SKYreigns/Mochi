@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from app.api.deps import approval_to_dict, services_from, task_to_dict
+from app.api.deps import approval_to_dict, execution_to_dict, services_from, task_to_dict
 from app.database.models import Approval, AuditLog, Task, TaskStep, ToolExecution
 
 router = APIRouter(tags=["tasks"])
@@ -69,20 +69,7 @@ async def get_task(task_id: str, request: Request) -> dict[str, Any]:
                 }
                 for step in steps
             ],
-            "executions": [
-                {
-                    "id": item.id,
-                    "step_index": item.step_index,
-                    "tool_name": item.tool_name,
-                    "arguments": item.arguments,
-                    "ok": item.ok,
-                    "error": item.error,
-                    "permission": item.permission,
-                    "duration_ms": round(item.duration_ms, 1),
-                    "created_at": item.created_at.isoformat(),
-                }
-                for item in executions
-            ],
+            "executions": [execution_to_dict(item) for item in executions],
             "approvals": [approval_to_dict(item, task) for item in approvals],
         }
 

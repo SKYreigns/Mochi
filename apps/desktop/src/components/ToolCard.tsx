@@ -58,6 +58,22 @@ export function ToolCard({ event }: { event: ChatToolEvent }) {
             )}
           </span>
         </span>
+        {event.approvalStatus && (
+          <Badge
+            tone={
+              event.approvalStatus === 'approved'
+                ? 'success'
+                : event.approvalStatus === 'pending'
+                  ? 'warning'
+                  : event.approvalStatus === 'denied' || event.approvalStatus === 'expired'
+                    ? 'danger'
+                    : 'neutral'
+            }
+            className="hidden sm:inline-flex"
+          >
+            {event.approvalStatus === 'pending' ? 'needs approval' : `approval ${event.approvalStatus}`}
+          </Badge>
+        )}
         {event.permission && (
           <Badge tone={event.permission === 'destructive' ? 'danger' : 'neutral'} className="hidden sm:inline-flex">
             {event.permission}

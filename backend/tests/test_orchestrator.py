@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+
+from sqlalchemy import select
 
 from app.core.enums import TaskStatus
 from app.core.errors import ProviderError
+from app.database.models import Message
 from app.orchestrator.planner import create_plan
 from app.providers.base import ProviderResponse, ToolCall
 from app.tools.base import EmptyArgs, build_tool, fail
@@ -26,6 +30,48 @@ async def _start(services, instruction: str) -> str:
     return task.id
 
 
+async def test_text_encoded_tool_call_is_recovered_and_executed(services, sandbox):
+    """qwen3 sometimes prints a tool call as JSON text instead of calling natively."""
+    target = sandbox / "recovered.txt"
+    target.write_text("recovered body", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            ProviderResponse(
+                content=json.dumps(
+                    {"name": "files.read_file", "arguments": {"path": str(target)}}
+                )
+            ),
+            ProviderResponse(content="The file contains: recovered body."),
+        ],
+        plan={
+            "objective": "Read a file",
+            "steps": [{"title": "Read", "tools": ["files.read_file"]}],
+        },
+    )
+    await install_provider(services, provider)
+    task = await wait_for_task(services, await _start(services, "Read the recovered file"))
+
+    assert task.status == "completed"
+    assert task.metadata_json["statistics"]["tools"] == 1
+    assert task.metadata_json["statistics"]["succeeded"] == 1
+    assert task.metadata_json["executions"][0]["tool"] == "files.read_file"
+    assert task.metadata_json["executions"][0]["verified"] is True
+    # The text-encoded call is not shown as the assistant's answer.
+    assert '"arguments"' not in (task.result or "")
+    assert "recovered body" in (task.result or "")
+
+    # It is also never persisted as a visible chat message.
+    async with services.db.session() as session:
+        stored = (
+            await session.execute(
+                select(Message).where(Message.conversation_id == task.conversation_id)
+            )
+        ).scalars().all()
+    contents = [message.content for message in stored if message.role == "assistant"]
+    assert contents, "the final answer should be stored"
+    assert not any('"arguments"' in content for content in contents)
+
+
 async def test_successful_tool_execution(services, sandbox):
     (sandbox / "hello.txt").write_text("hello", encoding="utf-8")
     provider = ScriptedProvider(
@@ -43,6 +89,27 @@ async def test_successful_tool_execution(services, sandbox):
     assert "Execution evidence" in task.result
     assert task.metadata_json["statistics"]["succeeded"] == 1
     assert task.metadata_json["statistics"]["failed"] == 0
+
+
+async def test_agent_only_sends_planned_tools(services, sandbox):
+    provider = ScriptedProvider(
+        [
+            tool_response(ToolCall(id="call_1", name="files.list_directory", arguments={"path": str(sandbox)})),
+            ProviderResponse(content="Listed the sandbox."),
+        ],
+        plan={
+            "objective": "List the sandbox",
+            "steps": [{"title": "List files", "tools": ["files.list_directory"]}],
+        },
+    )
+    await install_provider(services, provider)
+    task_id = await _start(services, "List my sandbox folder")
+    await wait_for_task(services, task_id)
+
+    assert provider.tools_seen
+    names = {spec["function"]["name"] for spec in provider.tools_seen[0]}
+    assert names == {"files.list_directory"}
+    assert len(services.registry.specs()) > len(names)
 
 
 async def test_multiple_sequential_tool_calls(services, sandbox):
@@ -81,6 +148,26 @@ async def test_planning_failure_uses_safe_fallback(services):
     assert plan["source"] == "fallback"
     assert plan["objective"] == "Find my notes"
     assert plan["steps"]
+
+
+def test_planner_tolerates_extra_trailing_brace():
+    from app.orchestrator.planner import _extract_json
+
+    plan = _extract_json(
+        '{"objective": "Check CPU and RAM", "steps": [{"title": "CPU", "tools": ["system.get_cpu_usage"]}]}}'
+    )
+    assert plan is not None
+    assert plan["steps"][0]["tools"] == ["system.get_cpu_usage"]
+
+
+def test_planner_extracts_json_from_surrounding_prose():
+    from app.orchestrator.planner import _extract_json
+
+    plan = _extract_json(
+        'Here is the plan:\n```json\n{"objective": "List files", "steps": [{"title": "List"}]}\n```\nDone.'
+    )
+    assert plan is not None
+    assert plan["objective"] == "List files"
 
 
 async def test_provider_error_marks_task_failed(services):

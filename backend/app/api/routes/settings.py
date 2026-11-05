@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,34 @@ async def update_settings(body: SettingsPatch, request: Request) -> dict[str, An
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail="temperature must be between 0 and 2") from exc
             llm["temperature"] = temperature
+        if "think" in llm and llm["think"] is not None:
+            think = llm["think"]
+            if isinstance(think, str) and think.strip().lower() in {"true", "false"}:
+                think = think.strip().lower() == "true"
+            if not isinstance(think, bool):
+                raise HTTPException(status_code=422, detail="think must be true, false or null")
+            llm["think"] = think
+        if "keep_alive" in llm:
+            keep_alive = llm["keep_alive"]
+            if isinstance(keep_alive, int):
+                if keep_alive < -1:
+                    raise HTTPException(status_code=422, detail="keep_alive must be -1 or a duration")
+            elif not isinstance(keep_alive, str) or not re.fullmatch(
+                r"-?\d+(ns|us|ms|s|m|h)?", keep_alive.strip()
+            ):
+                raise HTTPException(
+                    status_code=422, detail="keep_alive must be an integer or a duration such as 10m"
+                )
+            else:
+                llm["keep_alive"] = keep_alive.strip()
+        if "num_ctx" in llm and llm["num_ctx"] is not None:
+            try:
+                num_ctx = int(llm["num_ctx"])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="num_ctx must be an integer") from exc
+            if not 1024 <= num_ctx <= 262144:
+                raise HTTPException(status_code=422, detail="num_ctx must be between 1024 and 262144")
+            llm["num_ctx"] = num_ctx
 
     async with services.db.session() as session:
         for key, value in updates.items():

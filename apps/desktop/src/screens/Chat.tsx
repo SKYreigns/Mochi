@@ -259,7 +259,10 @@ export function ChatScreen() {
                       {toolEvents.length > 0 && (
                         <div className="space-y-1.5">
                           {toolEvents.map((event) => (
-                            <ToolCard key={`${event.key}-${event.status}-${event.durationMs ?? ''}`} event={event} />
+                            <ToolCard
+                              key={event.id ?? `${event.key}-${event.status}-${event.durationMs ?? ''}`}
+                              event={event}
+                            />
                           ))}
                         </div>
                       )}
@@ -395,7 +398,7 @@ function MessageBubble({ message }: { message: ChatMessageView }) {
         {message.tools && message.tools.length > 0 && (
           <div className="mt-2 space-y-1.5">
             {message.tools.map((tool) => (
-              <ToolCard key={`${tool.key}-${tool.status}`} event={tool} />
+              <ToolCard key={tool.id ?? `${tool.key}-${tool.status}`} event={tool} />
             ))}
           </div>
         )}

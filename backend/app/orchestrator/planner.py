@@ -38,6 +38,12 @@ async def create_plan(
                 ),
             ],
             temperature=0.1,
+            # Planning is structured extraction, not open-ended reasoning. With
+            # qwen3:4b, thinking made this call take 33-113s and sometimes emit
+            # malformed JSON; JSON mode without thinking returns a valid plan in
+            # ~3s. Agent turns keep their configured thinking behaviour.
+            think=False,
+            json_mode=True,
         )
         data = _extract_json(response.content)
         if not data or not isinstance(data.get("steps"), list):
@@ -79,4 +85,14 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         loaded = json.loads(candidate)
         return loaded if isinstance(loaded, dict) else None
     except json.JSONDecodeError:
+        pass
+    # Small local models sometimes emit one extra closing brace or trailing
+    # prose. Parse the first complete JSON object and ignore the remainder.
+    start = candidate.find("{")
+    if start == -1:
         return None
+    try:
+        loaded, _end = json.JSONDecoder().raw_decode(candidate[start:])
+    except json.JSONDecodeError:
+        return None
+    return loaded if isinstance(loaded, dict) else None

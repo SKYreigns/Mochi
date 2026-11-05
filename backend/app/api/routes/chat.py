@@ -10,8 +10,8 @@ from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSock
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from app.api.deps import services_from, task_to_dict
-from app.database.models import Conversation, Message, Task
+from app.api.deps import execution_to_dict, services_from, task_to_dict
+from app.database.models import Conversation, Message, ToolExecution, Task
 
 router = APIRouter(tags=["chat"])
 ws_router = APIRouter()
@@ -107,6 +107,7 @@ async def conversation_messages(
             "messages": [
                 {
                     "id": message.id,
+                    "task_id": message.task_id,
                     "role": message.role,
                     "content": message.content,
                     "attachments": message.attachments or [],
@@ -114,6 +115,49 @@ async def conversation_messages(
                 }
                 for message in messages
             ],
+        }
+
+
+@router.get("/api/chat/conversations/{conversation_id}/executions")
+async def conversation_executions(
+    conversation_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """Persisted tool execution history for a conversation.
+
+    Ordered chronologically by start time, then step and id so the frontend can
+    rebuild a deterministic timeline and reconcile it with live events.
+    """
+    services = services_from(request)
+    async with services.db.session() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        statement = (
+            select(ToolExecution)
+            .where(ToolExecution.conversation_id == conversation_id)
+            .order_by(
+                func.coalesce(ToolExecution.started_at, ToolExecution.created_at).asc(),
+                ToolExecution.step_index.asc(),
+                ToolExecution.id.asc(),
+            )
+        )
+        total = (
+            await session.execute(
+                select(func.count(ToolExecution.id)).where(
+                    ToolExecution.conversation_id == conversation_id
+                )
+            )
+        ).scalar_one()
+        rows = (await session.execute(statement.offset(offset).limit(limit))).scalars().all()
+        return {
+            "conversation_id": conversation_id,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "executions": [execution_to_dict(row) for row in rows],
         }
 
 

@@ -28,6 +28,7 @@ class ScriptedProvider(LLMProvider):
         self.plan_calls = 0
         self.agent_calls = 0
         self.messages_seen: list[list[ChatMessage]] = []
+        self.tools_seen: list[list[dict[str, Any]]] = []
 
     async def chat(
         self,
@@ -36,7 +37,10 @@ class ScriptedProvider(LLMProvider):
         *,
         temperature: float = 0.2,
         on_text: TextCallback | None = None,
+        think: bool | None = None,
+        json_mode: bool = False,
     ) -> ProviderResponse:
+        _ = (think, json_mode)
         if tools is None:
             self.plan_calls += 1
             if self.fail_plan:
@@ -44,6 +48,8 @@ class ScriptedProvider(LLMProvider):
             return ProviderResponse(content=json.dumps(self.plan), finish_reason="stop")
         self.agent_calls += 1
         self.messages_seen.append(list(messages))
+        if tools is not None:
+            self.tools_seen.append(list(tools))
         if not self.responses:
             return ProviderResponse(content="No further scripted response.", finish_reason="stop")
         item = self.responses.pop(0)

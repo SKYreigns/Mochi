@@ -47,6 +47,9 @@ class SettingsService:
                 "model": app.llm_model,
                 "base_url": app.llm_base_url,
                 "temperature": app.llm_temperature,
+                "think": app.llm_think,
+                "keep_alive": app.llm_keep_alive,
+                "num_ctx": app.llm_num_ctx,
             },
             "allowed_directories": [str(p) for p in app.allowed_directories],
             "browser": {"headless": app.browser_headless},
@@ -100,17 +103,22 @@ class SettingsService:
 
     async def set(self, session: AsyncSession, key: str, value: Any) -> None:
         row = await session.get(ApplicationSetting, key)
+        top = key.split(".")[0]
+        if isinstance(value, dict):
+            # Persist the merged object, not the partial patch. Otherwise a UI
+            # update such as ``{"llm": {"temperature": 0.1}}`` would erase the
+            # model and provider from the database on the next restart.
+            current = self._cache.get(top)
+            base = current if isinstance(current, dict) else self._defaults().get(top, {})
+            value = _deep_merge(base, value)
         if row is None:
             row = ApplicationSetting(key=key, value=value)
             session.add(row)
         else:
             row.value = value
         await session.commit()
-        top = key.split(".")[0]
         if isinstance(value, dict):
-            current = self._cache.get(top)
-            base = current if isinstance(current, dict) else self._defaults().get(top, {})
-            self._cache[top] = _deep_merge(base, value)
+            self._cache[top] = value
         else:
             self._cache[key] = value
             if "." in key:

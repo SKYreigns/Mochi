@@ -165,13 +165,23 @@ export interface TaskStep {
 
 export interface ToolExecutionRecord {
   id: string
+  execution_id?: string
+  task_id: string
+  conversation_id: string | null
   step_index: number
   tool_name: string
   arguments: Record<string, unknown>
+  status: 'running' | 'pending_approval' | 'completed' | 'failed' | 'skipped' | 'cancelled' | 'interrupted'
   ok: boolean
+  verified: boolean
+  evidence: string
   error: string | null
+  hint: string | null
   permission: string
+  approval_status: string | null
   duration_ms: number
+  started_at: string | null
+  completed_at: string | null
   created_at: string
 }
 
@@ -207,6 +217,7 @@ export interface Conversation {
 
 export interface ChatMessage {
   id: string
+  task_id?: string | null
   role: 'user' | 'assistant' | 'system'
   content: string
   attachments: Array<{ name: string; path: string; mime: string; size: number }>

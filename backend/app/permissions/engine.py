@@ -14,7 +14,7 @@ from app.core.enums import PermissionMode, ToolPermission
 from app.core.errors import ApprovalTimeoutError, EmergencyStopError, PermissionDeniedError
 from app.core.events import EventBus
 from app.core.logging import audit, get_logger, redact_value
-from app.database.models import Approval, Task
+from app.database.models import Approval, AuditLog, Task
 from app.services.settings_service import SettingsService
 
 log = get_logger("permissions")
@@ -134,6 +134,24 @@ class PermissionEngine:
             status="pending",
         )
         session.add(approval)
+        await session.flush()
+        # Persist the audit record alongside the request: surviving a restart
+        # matters more than a log line for an operation that can change state.
+        session.add(
+            AuditLog(
+                event="approval.requested",
+                actor="agent",
+                action=tool_name,
+                target=str(redact_value(arguments))[:400],
+                outcome="pending",
+                detail={
+                    "approval_id": approval.id,
+                    "permission": permission,
+                    "reason": reason,
+                },
+                task_id=task_id,
+            )
+        )
         await session.commit()
 
         loop = asyncio.get_running_loop()
@@ -170,6 +188,17 @@ class PermissionEngine:
         except asyncio.TimeoutError:
             approval.status = "expired"
             approval.decided_at = datetime.now(timezone.utc)
+            session.add(
+                AuditLog(
+                    event="approval.expired",
+                    actor="system",
+                    action=tool_name,
+                    target=str(redact_value(arguments))[:400],
+                    outcome="expired",
+                    detail={"approval_id": approval.id, "reason": reason},
+                    task_id=task_id,
+                )
+            )
             await session.commit()
             await self.events.publish(
                 "approval.resolved",
@@ -213,6 +242,21 @@ class PermissionEngine:
         approval.status = "approved" if approved else "denied"
         approval.decision_note = note
         approval.decided_at = datetime.now(timezone.utc)
+        session.add(
+            AuditLog(
+                event="approval.resolved",
+                actor="user",
+                action=approval.tool_name,
+                target=str(redact_value(approval.arguments))[:400],
+                outcome=approval.status,
+                detail={
+                    "approval_id": approval.id,
+                    "approved": approved,
+                    "note": note,
+                },
+                task_id=approval.task_id,
+            )
+        )
         await session.commit()
 
         waiter = self._waiters.get(approval_id)
@@ -245,6 +289,17 @@ class PermissionEngine:
         for approval in approvals:
             approval.status = "cancelled"
             approval.decided_at = datetime.now(timezone.utc)
+            session.add(
+                AuditLog(
+                    event="approval.cancelled",
+                    actor="system",
+                    action=approval.tool_name,
+                    target=str(redact_value(approval.arguments))[:400],
+                    outcome="cancelled",
+                    detail={"approval_id": approval.id, "reason": "task cancelled"},
+                    task_id=task_id,
+                )
+            )
             waiter = self._waiters.pop(approval.id, None)
             if waiter and not waiter.done():
                 waiter.cancel()
@@ -263,6 +318,17 @@ class PermissionEngine:
         for approval in approvals:
             approval.status = "cancelled"
             approval.decided_at = datetime.now(timezone.utc)
+            session.add(
+                AuditLog(
+                    event="approval.stale",
+                    actor="system",
+                    action=approval.tool_name,
+                    target=str(redact_value(approval.arguments))[:400],
+                    outcome="cancelled",
+                    detail={"approval_id": approval.id, "reason": "backend restarted"},
+                    task_id=approval.task_id,
+                )
+            )
         if approvals:
             await session.commit()
         return len(approvals)

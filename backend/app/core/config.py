@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     llm_model: str = ""
     llm_base_url: str = ""
     llm_temperature: float = Field(default=0.2, ge=0, le=2)
+    # ``None`` keeps the model default (qwen3 thinks by default). Set explicitly
+    # only after comparing reliability in the performance report.
+    llm_think: bool | None = None
+    llm_keep_alive: str = "10m"
+    llm_num_ctx: int | None = Field(default=None, ge=1024, le=262144)
 
     # Browser
     browser_headless: bool = False

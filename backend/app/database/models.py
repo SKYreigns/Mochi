@@ -54,6 +54,11 @@ class Message(Base):
     __tablename__ = "messages"
     id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("msg_"))
     conversation_id: Mapped[str] = mapped_column(String(40), ForeignKey("conversations.id"), index=True)
+    # Links the message to the task that produced it so persisted tool
+    # executions can be attached to the correct bubble on reload.
+    task_id: Mapped[str | None] = mapped_column(
+        String(40), ForeignKey("tasks.id"), nullable=True, index=True
+    )
     role: Mapped[str] = mapped_column(String(20))
     content: Mapped[str] = mapped_column(Text, default="")
     tool_calls: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
@@ -99,14 +104,26 @@ class ToolExecution(Base):
     __tablename__ = "tool_executions"
     id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("exe_"))
     task_id: Mapped[str] = mapped_column(String(40), ForeignKey("tasks.id"), index=True)
+    # Denormalized for deterministic conversation history recovery.
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(40), ForeignKey("conversations.id"), nullable=True, index=True
+    )
     step_index: Mapped[int] = mapped_column(Integer, default=0)
     tool_name: Mapped[str] = mapped_column(String(120), index=True)
     arguments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # running | pending_approval | completed | failed | skipped | cancelled | interrupted
+    status: Mapped[str] = mapped_column(String(20), default="completed", index=True)
     ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hint: Mapped[str | None] = mapped_column(Text, nullable=True)
     permission: Mapped[str] = mapped_column(String(20), default="read")
+    approval_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     duration_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

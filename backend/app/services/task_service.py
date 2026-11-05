@@ -12,7 +12,7 @@ from app.core.enums import TaskStatus
 from app.core.events import EventBus
 from app.core.logging import audit, get_logger
 from app.database.database import Database
-from app.database.models import Conversation, Message, Task
+from app.database.models import Conversation, Message, Task, ToolExecution
 from app.orchestrator.agent import AgentOrchestrator
 
 log = get_logger("tasks")
@@ -73,8 +73,13 @@ class TaskService:
                 metadata_json={},
             )
             session.add(task)
-            await session.commit()
+            await session.flush()
             task_id = task.id
+            if user_message_id:
+                message = await session.get(Message, user_message_id)
+                if message is not None:
+                    message.task_id = task_id
+            await session.commit()
 
         worker = asyncio.create_task(
             self._runner(
@@ -216,6 +221,43 @@ class TaskService:
         async with self.db.session() as session:
             rows = await session.execute(select(Task).order_by(Task.created_at.desc()).limit(limit))
             return list(rows.scalars().all())
+
+    async def recover_stale_state(self) -> int:
+        """Mark work left behind by a previous backend process.
+
+        A task cannot still be executing after the process that owned it exited.
+        Leaving it as ``running`` would make the UI wait forever and would hide
+        the interrupted execution from conversation history.
+        """
+        now = datetime.now(timezone.utc)
+        message = "Mochi restarted before this task finished."
+        async with self.db.session() as session:
+            tasks = (
+                await session.execute(select(Task).where(Task.status.not_in(_TERMINAL)))
+            ).scalars().all()
+            for task in tasks:
+                task.status = TaskStatus.FAILED.value
+                task.error = task.error or message
+                task.completed_at = now
+            executions = (
+                await session.execute(
+                    select(ToolExecution).where(
+                        ToolExecution.status.in_(["running", "pending_approval"])
+                    )
+                )
+            ).scalars().all()
+            for execution in executions:
+                execution.status = "interrupted"
+                execution.completed_at = now
+                execution.error = execution.error or message
+            await session.commit()
+            if tasks or executions:
+                log.info(
+                    "Recovered %d task(s) and %d execution(s) after restart",
+                    len(tasks),
+                    len(executions),
+                )
+            return len(tasks)
 
     async def shutdown(self) -> None:
         workers = list(self._running.items())

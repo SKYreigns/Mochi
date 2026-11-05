@@ -10,6 +10,7 @@ from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.logging import get_logger
+from app.database.migrations import apply_schema_migrations
 from app.database.models import Base, User
 
 log = get_logger("database")
@@ -41,6 +42,7 @@ class Database:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(apply_schema_migrations)
             for statement in FTS_SCHEMA:
                 try:
                     await conn.execute(text(statement))

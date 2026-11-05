@@ -21,7 +21,10 @@ class MockProvider(LLMProvider):
         *,
         temperature: float = 0.2,
         on_text: TextCallback | None = None,
+        think: bool | None = None,
+        json_mode: bool = False,
     ) -> ProviderResponse:
+        _ = (think, json_mode)
         tool_names = [tool["function"]["name"] for tool in (tools or []) if "function" in tool]
         text = (
             "**Offline test provider is active.** No language model is connected, so JARVIS "

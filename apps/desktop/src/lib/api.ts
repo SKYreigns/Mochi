@@ -21,6 +21,7 @@ import type {
   SystemProcess,
   Task,
   TaskDetail,
+  ToolExecutionRecord,
   ToolInfo,
   VoiceStatus,
   Workflow,
@@ -198,6 +199,14 @@ export const api = {
     request<{ conversation: { id: string; title: string; created_at: string }; messages: ChatMessage[] }>(
       `/api/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
     ),
+  executions: (conversationId: string, params: { limit?: number; offset?: number } = {}) =>
+    request<{
+      conversation_id: string
+      total: number
+      limit: number
+      offset: number
+      executions: ToolExecutionRecord[]
+    }>(`/api/chat/conversations/${encodeURIComponent(conversationId)}/executions${query(params)}`),
   archiveConversation: (conversationId: string) =>
     request<{ archived: string }>(
       `/api/chat/conversations/${encodeURIComponent(conversationId)}`,

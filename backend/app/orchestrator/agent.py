@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,7 +22,7 @@ from app.core.errors import (
     ProviderError,
 )
 from app.core.logging import audit, get_logger, redact, redact_payload, redact_value
-from app.database.models import AuditLog, Message, Task, TaskStep, ToolExecution
+from app.database.models import Approval, AuditLog, Message, Task, TaskStep, ToolExecution
 from app.memory.manager import MemoryManager
 from app.orchestrator.planner import create_plan
 from app.orchestrator.prompts import system_prompt
@@ -74,7 +76,16 @@ class AgentOrchestrator:
             log.error("Task %s not found", task_id)
             return
 
-        statistics: dict[str, Any] = {"tools": 0, "succeeded": 0, "failed": 0, "unverified": 0}
+        statistics: dict[str, Any] = {
+            "tools": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "unverified": 0,
+            "llm_calls": 0,
+            "llm_ms": 0.0,
+            "planner_ms": 0.0,
+            "llm": [],
+        }
         executions: list[dict[str, Any]] = []
         final_content = ""
         status = TaskStatus.COMPLETED
@@ -93,7 +104,12 @@ class AgentOrchestrator:
             memory_context = await self.memory.context_for(session, instruction)
 
             provider = await self.services.provider_manager.get()
+            planner_started = time.perf_counter()
             plan = await create_plan(provider, instruction, self.registry.names(), memory_context)
+            statistics["planner_ms"] = round((time.perf_counter() - planner_started) * 1000, 1)
+            statistics["plan_steps"] = len(plan.get("steps", []))
+            statistics["plan_source"] = plan.get("source", "model")
+            statistics["history_messages"] = len(history)
             task.objective = plan["objective"]
             task.plan = plan["steps"]
             task.status = TaskStatus.RUNNING.value
@@ -121,6 +137,21 @@ class AgentOrchestrator:
             messages.append(ChatMessage(role="user", content=user_content))
 
             tool_specs = self.registry.specs()
+            planned_tools = {
+                name
+                for step in plan.get("steps", [])
+                if isinstance(step, dict)
+                for name in step.get("tools", [])
+                if self.registry.get(name) is not None
+            }
+            if planned_tools:
+                # Small local models degrade sharply when given dozens of schemas.
+                # Restrict the agent turn to the tools the planner actually chose.
+                tool_specs = [
+                    spec
+                    for spec in tool_specs
+                    if spec["function"]["name"] in planned_tools
+                ]
             step_index = 0
             no_progress_signature: str | None = None
             no_progress_repeats = 0
@@ -130,19 +161,68 @@ class AgentOrchestrator:
                 await self.events.publish("agent.thinking", {"task_id": task_id, "iteration": iteration + 1})
 
                 try:
+                    llm_started = time.perf_counter()
                     response = await provider.chat(
                         messages,
                         tool_specs,
                         temperature=self.services.settings.llm.get("temperature", 0.2),
                         on_text=_stream_callback(self.events, task_id),
                     )
+                    llm_ms = (time.perf_counter() - llm_started) * 1000
                 except ProviderError as exc:
                     raise
                 except Exception as exc:  # provider boundary
                     raise ProviderError(f"The model provider failed: {exc}") from exc
 
+                usage = dict(response.usage or {})
+                statistics["llm_calls"] += 1
+                statistics["llm_ms"] = round(statistics["llm_ms"] + llm_ms, 1)
+                metrics = {
+                    "iteration": iteration + 1,
+                    "duration_ms": round(llm_ms, 1),
+                    "messages": len(messages),
+                    "tools": len(tool_specs),
+                    "system_prompt_chars": len(prompt),
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "tokens_per_second": usage.get("tokens_per_second"),
+                    "first_token_ms": usage.get("first_token_ms"),
+                }
+                statistics["llm"].append(metrics)
+                await self.events.publish("llm.metrics", {"task_id": task_id, **metrics})
+
+                # Small local models occasionally print a tool call as JSON text
+                # instead of using native tool calling. Recover it before the
+                # content is persisted, so raw JSON never becomes the visible
+                # assistant answer while the requested action stays unexecuted.
+                if not response.tool_calls:
+                    salvaged = self._recover_text_tool_call(response.content)
+                    if salvaged is not None:
+                        response = response.model_copy(
+                            update={"content": "", "tool_calls": [salvaged]}
+                        )
+                        audit(
+                            "tool.recovered",
+                            task_id=task_id,
+                            tool=salvaged.name,
+                            arguments=redact_value(salvaged.arguments),
+                        )
+                        await self.events.publish(
+                            "tool.recovered",
+                            {
+                                "task_id": task_id,
+                                "tool": salvaged.name,
+                                "arguments": redact_value(salvaged.arguments),
+                            },
+                        )
+                        log.warning(
+                            "Recovered a text-encoded tool call for %s on task %s",
+                            salvaged.name,
+                            task_id,
+                        )
+
                 if response.content.strip():
-                    await self._store_assistant_message(session, conversation_id, response.content)
+                    await self._store_assistant_message(session, conversation_id, response.content, task_id)
                     await self.events.publish(
                         "llm.completed", {"task_id": task_id, "content": redact(response.content, 20000)}
                     )
@@ -160,13 +240,93 @@ class AgentOrchestrator:
 
                 for call in response.tool_calls:
                     step_index += 1
+                    started_at = datetime.now(timezone.utc)
                     tool_def = self.registry.get(call.name)
                     if tool_def is None:
+                        # Persist the rejected attempt so history is complete and
+                        # the UI can explain why nothing ran.
                         result = fail(
                             f"Unknown tool '{call.name}'.",
                             hint="Use only tools from the provided list.",
                         )
-                        duration_ms = 0.0
+                        execution = ToolExecution(
+                            task_id=task_id,
+                            conversation_id=conversation_id,
+                            step_index=step_index,
+                            tool_name=call.name,
+                            arguments=redact_value(call.arguments),
+                            status="failed",
+                            ok=False,
+                            verified=False,
+                            error=redact(result.error or "", 2000),
+                            hint=result.hint,
+                            permission="unknown",
+                            duration_ms=0.0,
+                            started_at=started_at,
+                            completed_at=started_at,
+                        )
+                        session.add(execution)
+                        await session.commit()
+                        session.add(
+                            AuditLog(
+                                event="tool.rejected",
+                                actor="agent",
+                                action=call.name,
+                                target=str(redact_value(call.arguments))[:400],
+                                outcome="failed",
+                                detail={"error": result.error, "reason": "unknown tool"},
+                                task_id=task_id,
+                            )
+                        )
+                        await session.commit()
+                        await self.events.publish(
+                            "tool.completed",
+                            {
+                                "task_id": task_id,
+                                "conversation_id": conversation_id,
+                                "execution_id": execution.id,
+                                "step": step_index,
+                                "tool": call.name,
+                                "status": "failed",
+                                "ok": False,
+                                "verified": False,
+                                "evidence": "",
+                                "error": result.error,
+                                "hint": result.hint,
+                                "permission": "unknown",
+                                "duration_ms": 0.0,
+                            },
+                        )
+                        statistics["tools"] += 1
+                        statistics["failed"] += 1
+                        executions.append(
+                            {
+                                "id": execution.id,
+                                "index": step_index,
+                                "tool": call.name,
+                                "arguments": redact_value(call.arguments),
+                                "ok": False,
+                                "verified": False,
+                                "status": "failed",
+                                "evidence": "",
+                                "error": redact(result.error or "", 600),
+                                "attempts": 0,
+                                "duration_ms": 0.0,
+                            }
+                        )
+                        signature = (
+                            f"{call.name}:{json.dumps(call.arguments, sort_keys=True, default=str)}"
+                        )
+                        if signature == no_progress_signature:
+                            no_progress_repeats += 1
+                        else:
+                            no_progress_repeats = 0
+                        no_progress_signature = signature
+                        if no_progress_repeats >= 3:
+                            raise JarvisError(
+                                "The agent repeated the same unknown action three times.",
+                                hint="The task was stopped to avoid a loop. Retry with a tool from the provided list.",
+                            )
                         await self._append_tool_result(messages, call, result)
                         continue
 
@@ -177,19 +337,33 @@ class AgentOrchestrator:
                         title=f"{call.name}",
                         status="running",
                         detail={"arguments": redact_value(call.arguments)},
-                        started_at=datetime.now(timezone.utc),
+                        started_at=started_at,
+                    )
+                    execution = ToolExecution(
+                        task_id=task_id,
+                        conversation_id=conversation_id,
+                        step_index=step_index,
+                        tool_name=call.name,
+                        arguments=redact_value(call.arguments),
+                        status="running",
+                        permission=tool_def.permission.value,
+                        started_at=started_at,
                     )
                     session.add(step)
+                    session.add(execution)
                     task.current_step = step_index
                     await session.commit()
                     await self.events.publish(
                         "tool.started",
                         {
                             "task_id": task_id,
+                            "conversation_id": conversation_id,
+                            "execution_id": execution.id,
                             "step": step_index,
                             "tool": call.name,
                             "arguments": redact_value(call.arguments),
                             "permission": tool_def.permission.value,
+                            "status": "running",
                         },
                     )
 
@@ -197,11 +371,26 @@ class AgentOrchestrator:
                     result: ToolResult
                     duration_ms = 0.0
                     attempts = 0
+                    execution_status = "failed"
 
                     if not decision.allowed:
                         result = fail(decision.reason, hint="Change the request or switch the permission mode in Settings.")
                         step.status = "skipped"
+                        execution_status = "skipped"
                     elif decision.requires_approval:
+                        execution.status = "pending_approval"
+                        await session.commit()
+                        await self.events.publish(
+                            "tool.status",
+                            {
+                                "task_id": task_id,
+                                "conversation_id": conversation_id,
+                                "execution_id": execution.id,
+                                "step": step_index,
+                                "tool": call.name,
+                                "status": "pending_approval",
+                            },
+                        )
                         try:
                             await self.permissions.request_approval(
                                 session,
@@ -215,16 +404,20 @@ class AgentOrchestrator:
                             result, duration_ms, attempts = await self._execute_with_retries(
                                 session, call, task_id, conversation_id, auto_approved, attempts
                             )
+                            execution_status = "completed" if result.ok else "failed"
                         except PermissionDeniedError as exc:
                             result = fail(exc.message, hint=exc.hint)
                             step.status = "skipped"
+                            execution_status = "skipped"
                         except ApprovalTimeoutError as exc:
                             result = fail(exc.message, hint=exc.hint)
                             step.status = "failed"
+                            execution_status = "failed"
                     else:
                         result, duration_ms, attempts = await self._execute_with_retries(
                             session, call, task_id, conversation_id, auto_approved, attempts
                         )
+                        execution_status = "completed" if result.ok else "failed"
 
                     elapsed_total = duration_ms
                     if result.ok:
@@ -232,17 +425,21 @@ class AgentOrchestrator:
                         if not result.verified:
                             statistics["unverified"] += 1
                         step.status = "completed"
+                        execution_status = "completed"
                     else:
                         statistics["failed"] += 1
-                        step.status = "failed"
+                        if step.status not in {"skipped"}:
+                            step.status = "failed"
                     statistics["tools"] += 1
 
                     record = {
+                        "id": execution.id,
                         "index": step_index,
                         "tool": call.name,
                         "arguments": redact_value(call.arguments),
                         "ok": result.ok,
                         "verified": result.verified,
+                        "status": execution_status,
                         "evidence": redact(result.evidence, 600),
                         "error": redact(result.error or "", 600),
                         "attempts": attempts,
@@ -250,27 +447,33 @@ class AgentOrchestrator:
                     }
                     executions.append(record)
 
-                    step.completed_at = datetime.now(timezone.utc)
+                    completed_at = datetime.now(timezone.utc)
+                    step.completed_at = completed_at
                     step.detail = record
-                    execution = ToolExecution(
-                        task_id=task_id,
-                        step_index=step_index,
-                        tool_name=call.name,
-                        arguments=redact_value(call.arguments),
-                        result=redact_payload(result.model_dump(mode="json")),
-                        ok=result.ok,
-                        error=redact(result.error or "", 2000) or None,
-                        permission=tool_def.permission.value,
-                        duration_ms=elapsed_total,
-                    )
-                    session.add(execution)
+                    approval_status = None
+                    if decision.requires_approval:
+                        approval_status = await self._latest_approval_status(session, task_id, call.name)
+                    execution.status = execution_status
+                    execution.result = redact_payload(result.model_dump(mode="json"))
+                    execution.ok = result.ok
+                    execution.verified = result.verified
+                    execution.evidence = redact(result.evidence, 2000) or None
+                    execution.error = redact(result.error or "", 2000) or None
+                    execution.hint = result.hint
+                    execution.approval_status = approval_status
+                    execution.duration_ms = elapsed_total
+                    execution.completed_at = completed_at
                     session.add(
                         AuditLog(
-                            event="tool.executed",
+                            event="tool.skipped" if execution_status == "skipped" else "tool.executed",
                             actor="agent",
                             action=call.name,
                             target=str(redact_value(call.arguments))[:400],
-                            outcome="ok" if result.ok else "failed",
+                            outcome=(
+                                "skipped"
+                                if execution_status == "skipped"
+                                else "ok" if result.ok else "failed"
+                            ),
                             detail=record,
                             task_id=task_id,
                         )
@@ -280,14 +483,19 @@ class AgentOrchestrator:
                         "tool.completed",
                         {
                             "task_id": task_id,
+                            "conversation_id": conversation_id,
+                            "execution_id": execution.id,
                             "step": step_index,
                             "tool": call.name,
+                            "status": execution_status,
                             "ok": result.ok,
                             "verified": result.verified,
                             "evidence": redact(result.evidence, 2000),
                             "error": result.error,
                             "hint": result.hint,
                             "artifacts": result.artifacts,
+                            "permission": tool_def.permission.value,
+                            "approval_status": approval_status,
                             "duration_ms": round(elapsed_total, 1),
                         },
                     )
@@ -310,14 +518,18 @@ class AgentOrchestrator:
                 final_content = ""
                 task.error = f"Reached the maximum of {app_settings.max_steps} steps without completing the objective."
 
-            # Never report success when every action the agent attempted failed,
-            # even if the model's final text claims otherwise.
-            if status == TaskStatus.COMPLETED and statistics["failed"] > 0 and statistics["succeeded"] == 0:
+            # Never report success when a required action failed, even if the
+            # model's final text claims otherwise. An execution record only stays
+            # failed when retries were exhausted or authorization was refused.
+            unresolved = [item for item in executions if not item["ok"]]
+            if status == TaskStatus.COMPLETED and unresolved:
                 status = TaskStatus.FAILED
                 final_content = ""
+                failed_tools = ", ".join(sorted({str(item["tool"]) for item in unresolved}))
                 task.error = (
-                    "Every attempted action failed, so the task is not reported as complete. "
-                    "Review the execution evidence and retry with corrected parameters."
+                    f"Task not reported as complete: {len(unresolved)} action(s) failed "
+                    f"({failed_tools}). Review the execution evidence and retry with corrected "
+                    "parameters."
                 )
 
             if status != TaskStatus.COMPLETED:
@@ -421,6 +633,39 @@ class AgentOrchestrator:
             )
             await asyncio.sleep(min(4.0, 0.8 * attempts))
 
+    _TEXT_TOOL_CALL_FENCE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.S)
+
+    def _recover_text_tool_call(self, content: str) -> ToolCall | None:
+        """Parse a tool call that the model wrote as plain JSON text.
+
+        Only an exact JSON object that names a registered tool qualifies, so a
+        normal JSON answer is never mistaken for an action.
+        """
+        text = (content or "").strip()
+        if not text:
+            return None
+        fenced = self._TEXT_TOOL_CALL_FENCE.fullmatch(text)
+        if fenced:
+            text = fenced.group(1).strip()
+        if not (text.startswith("{") and text.endswith("}")):
+            return None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        name = payload.get("name")
+        arguments = payload.get("arguments", {})
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return None
+        if self.registry.get(name.strip()) is None:
+            return None
+        call_id = payload.get("id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            call_id = f"call_recovered_{uuid.uuid4().hex[:12]}"
+        return ToolCall(id=call_id, name=name.strip(), arguments=arguments)
+
     async def _append_tool_result(self, messages: list[ChatMessage], call: ToolCall, result: ToolResult) -> None:
         payload = result.as_message()
         if len(payload) > MAX_TOOL_MESSAGE_CHARS:
@@ -429,14 +674,55 @@ class AgentOrchestrator:
             ChatMessage(role="tool", content=payload, tool_call_id=call.id, name=call.name)
         )
 
-    async def _store_assistant_message(self, session: AsyncSession, conversation_id: str | None, content: str) -> None:
+    async def _store_assistant_message(
+        self,
+        session: AsyncSession,
+        conversation_id: str | None,
+        content: str,
+        task_id: str | None = None,
+    ) -> None:
         if not conversation_id:
             return
-        message = Message(conversation_id=conversation_id, role="assistant", content=content)
+        message = Message(
+            conversation_id=conversation_id,
+            task_id=task_id,
+            role="assistant",
+            content=content,
+        )
         session.add(message)
         await session.flush()
         await self.memory.index_message(session, message)
         await session.commit()
+
+    async def _latest_approval_status(
+        self, session: AsyncSession, task_id: str, tool_name: str
+    ) -> str | None:
+        approval = (
+            await session.execute(
+                select(Approval)
+                .where(Approval.task_id == task_id, Approval.tool_name == tool_name)
+                .order_by(Approval.requested_at.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        return approval.status if approval is not None else None
+
+    async def _close_open_executions(
+        self, session: AsyncSession, task_id: str, *, status: str, error: str
+    ) -> None:
+        rows = (
+            await session.execute(
+                select(ToolExecution).where(
+                    ToolExecution.task_id == task_id,
+                    ToolExecution.status.in_(["running", "pending_approval"]),
+                )
+            )
+        ).scalars().all()
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            row.status = status
+            row.completed_at = now
+            row.error = row.error or redact(error, 2000)
 
     async def _load_history(
         self, session: AsyncSession, conversation_id: str | None, user_message_id: str | None
@@ -490,7 +776,10 @@ class AgentOrchestrator:
                 task.status = TaskStatus.CANCELLED.value
                 task.cancelled_at = datetime.now(timezone.utc)
                 task.error = "Cancelled by the user."
-                await session.commit()
+            await self._close_open_executions(
+                session, task_id, status="cancelled", error="Cancelled by the user."
+            )
+            await session.commit()
             await self.permissions.cancel_task_approvals(session, task_id)
             await self.events.publish(
                 "task.cancelled", {"task_id": task_id, "conversation_id": conversation_id, "status": "cancelled"}
@@ -530,7 +819,13 @@ class AgentOrchestrator:
                         "statistics": statistics,
                         "executions": executions or [],
                     }
-                await session.commit()
+            await self._close_open_executions(
+                session,
+                task_id,
+                status="cancelled" if status == TaskStatus.CANCELLED else "interrupted",
+                error=error,
+            )
+            await session.commit()
             await self.permissions.cancel_task_approvals(session, task_id)
             await self.events.publish(
                 "task.failed" if status == TaskStatus.FAILED else "task.cancelled",

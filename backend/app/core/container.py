@@ -125,6 +125,7 @@ class AppServices:
             cancelled = await self.permissions.mark_stale_approvals(session)
             if cancelled:
                 log.info("Cancelled %d stale approval request(s) from a previous session", cancelled)
+            await self.tasks.recover_stale_state()
             existing = (await session.execute(select(Workflow).limit(1))).scalars().first()
             if existing is None:
                 await self.workflows.create_workflow(

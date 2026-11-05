@@ -70,6 +70,8 @@ class LLMProvider(ABC):
         *,
         temperature: float = 0.2,
         on_text: TextCallback | None = None,
+        think: bool | None = None,
+        json_mode: bool = False,
     ) -> ProviderResponse:
         ...
 

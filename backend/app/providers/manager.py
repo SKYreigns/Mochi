@@ -30,16 +30,33 @@ class ProviderManager:
         self.settings = settings
         self.runtime_settings = runtime_settings
         self._provider: LLMProvider | None = None
-        self._signature: tuple[str, str, str, float] | None = None
+        self._signature: tuple[Any, ...] | None = None
 
     def _config(self) -> dict[str, Any]:
         config = self.runtime_settings.llm
         provider = str(config.get("provider") or "ollama").strip().lower()
+        think = config.get("think")
+        if isinstance(think, str):
+            think = think.strip().lower()
+            think = True if think in {"1", "true", "yes", "on"} else False if think in {"0", "false", "no", "off"} else None
+        elif think is not None:
+            think = bool(think)
+        keep_alive = config.get("keep_alive")
+        if isinstance(keep_alive, str) and not keep_alive.strip():
+            keep_alive = None
+        num_ctx = config.get("num_ctx")
+        try:
+            num_ctx = int(num_ctx) if num_ctx not in (None, "", 0, "0") else None
+        except (TypeError, ValueError):
+            num_ctx = None
         return {
             "provider": provider,
             "model": str(config.get("model") or "").strip(),
             "base_url": str(config.get("base_url") or _DEFAULT_BASE_URLS.get(provider, "")).strip(),
             "temperature": float(config.get("temperature", 0.2)),
+            "think": think,
+            "keep_alive": keep_alive,
+            "num_ctx": num_ctx,
         }
 
     def _build(self, config: dict[str, Any]) -> LLMProvider:
@@ -47,7 +64,13 @@ class ProviderManager:
         if provider == "mock":
             return MockProvider()
         if provider == "ollama":
-            return OllamaProvider(base_url=config["base_url"], model=config["model"])
+            return OllamaProvider(
+                base_url=config["base_url"],
+                model=config["model"],
+                think=config.get("think"),
+                keep_alive=config.get("keep_alive"),
+                num_ctx=config.get("num_ctx"),
+            )
         if provider not in _DEFAULT_BASE_URLS and not config["base_url"]:
             raise ConfigurationError(
                 f"Unknown provider '{provider}' with no base URL.",
@@ -67,7 +90,15 @@ class ProviderManager:
 
     async def get(self) -> LLMProvider:
         config = self._config()
-        signature = (config["provider"], config["model"], config["base_url"], config["temperature"])
+        signature = (
+            config["provider"],
+            config["model"],
+            config["base_url"],
+            config["temperature"],
+            config["think"],
+            config["keep_alive"],
+            config["num_ctx"],
+        )
         if self._provider is not None and signature == self._signature:
             return self._provider
         if self._provider is not None:

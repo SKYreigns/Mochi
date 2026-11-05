@@ -51,7 +51,10 @@ class OpenAICompatibleProvider(LLMProvider):
         *,
         temperature: float = 0.2,
         on_text: TextCallback | None = None,
+        think: bool | None = None,
+        json_mode: bool = False,
     ) -> ProviderResponse:
+        _ = (think, json_mode)
         if not self.model:
             raise ConfigurationError(
                 "No model is configured for this provider.",

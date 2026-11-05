@@ -51,6 +51,27 @@ async def test_settings_get_and_patch(api, sandbox):
     restored = await api.patch("/api/settings", json={"updates": {"permission_mode": "assisted"}})
     assert restored.json()["settings"]["permission_mode"] == "assisted"
 
+    # Partial nested patches must merge with the persisted object, not replace it.
+    partial = await api.patch("/api/settings", json={"updates": {"llm": {"temperature": 0.3}}})
+    assert partial.status_code == 200
+    assert partial.json()["settings"]["llm"]["model"] == "mock"
+
+    bad_think = await api.patch("/api/settings", json={"updates": {"llm": {"think": "maybe"}}})
+    assert bad_think.status_code == 422
+    bad_keep = await api.patch("/api/settings", json={"updates": {"llm": {"keep_alive": "soon"}}})
+    assert bad_keep.status_code == 422
+    bad_ctx = await api.patch("/api/settings", json={"updates": {"llm": {"num_ctx": 12}}})
+    assert bad_ctx.status_code == 422
+
+    tuned = await api.patch(
+        "/api/settings",
+        json={"updates": {"llm": {"think": False, "keep_alive": "15m", "num_ctx": 8192}}},
+    )
+    assert tuned.status_code == 200
+    assert tuned.json()["settings"]["llm"]["think"] is False
+    assert tuned.json()["settings"]["llm"]["keep_alive"] == "15m"
+    assert tuned.json()["settings"]["llm"]["num_ctx"] == 8192
+
 
 async def test_settings_provider_and_models(api):
     provider = await api.get("/api/settings/provider")

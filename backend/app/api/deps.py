@@ -8,7 +8,7 @@ from fastapi import HTTPException, Request
 
 from app.core.container import AppServices
 from app.core.errors import JarvisError
-from app.database.models import Approval, Task
+from app.database.models import Approval, Task, ToolExecution
 from app.tools.base import ToolContext, ToolResult
 
 
@@ -62,6 +62,36 @@ def task_to_dict(task: Task) -> dict[str, Any]:
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
         "cancelled_at": task.cancelled_at.isoformat() if task.cancelled_at else None,
+    }
+
+
+def execution_to_dict(execution: ToolExecution) -> dict[str, Any]:
+    """Serializable, redacted execution history entry.
+
+    The full ``result`` payload stays in the database; the API exposes the
+    verified evidence and error text the UI actually renders.
+    """
+    status = execution.status or ("completed" if execution.ok else "failed")
+    return {
+        "id": execution.id,
+        "execution_id": execution.id,
+        "task_id": execution.task_id,
+        "conversation_id": execution.conversation_id,
+        "step_index": execution.step_index,
+        "tool_name": execution.tool_name,
+        "arguments": execution.arguments or {},
+        "status": status,
+        "ok": bool(execution.ok),
+        "verified": bool(execution.verified),
+        "evidence": execution.evidence or "",
+        "error": execution.error,
+        "hint": execution.hint,
+        "permission": execution.permission,
+        "approval_status": execution.approval_status,
+        "duration_ms": round(execution.duration_ms or 0.0, 1),
+        "started_at": execution.started_at.isoformat() if execution.started_at else None,
+        "completed_at": execution.completed_at.isoformat() if execution.completed_at else None,
+        "created_at": execution.created_at.isoformat() if execution.created_at else None,
     }
 
 

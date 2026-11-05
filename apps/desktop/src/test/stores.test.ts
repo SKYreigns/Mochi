@@ -2,13 +2,66 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useToastStore, toast } from '@/stores/toast'
 import { applyPreferences, useAppStore } from '@/stores/app'
 import { useChatStore } from '@/stores/chat'
-import type { AppEvent } from '@/lib/types'
+import { api } from '@/lib/api'
+import type { AppEvent, ChatMessage, ToolExecutionRecord } from '@/lib/types'
 
 function event(type: string, payload: Record<string, unknown> = {}): AppEvent {
   return { seq: 1, type, ts: new Date().toISOString(), payload }
 }
 
+function message(overrides: Partial<ChatMessage> = {}): ChatMessage {
+  return {
+    id: 'msg-1',
+    task_id: 'task-1',
+    role: 'assistant',
+    content: 'The file says hello.',
+    attachments: [],
+    created_at: '2026-01-01T10:00:02Z',
+    ...overrides,
+  }
+}
+
+function execution(overrides: Partial<ToolExecutionRecord> = {}): ToolExecutionRecord {
+  return {
+    id: 'exe-1',
+    task_id: 'task-1',
+    conversation_id: 'conv-1',
+    step_index: 1,
+    tool_name: 'files.read_file',
+    arguments: { path: 'a.txt' },
+    status: 'completed',
+    ok: true,
+    verified: true,
+    evidence: 'read 12 bytes',
+    error: null,
+    hint: null,
+    permission: 'read',
+    approval_status: null,
+    duration_ms: 42,
+    started_at: '2026-01-01T10:00:00Z',
+    completed_at: '2026-01-01T10:00:01Z',
+    created_at: '2026-01-01T10:00:00Z',
+    ...overrides,
+  }
+}
+
+async function loadConversation(records: ToolExecutionRecord[], messages = [message()]) {
+  vi.spyOn(api, 'messages').mockResolvedValue({
+    conversation: { id: 'conv-1', title: 'Test', created_at: '2026-01-01T10:00:00Z' },
+    messages,
+  })
+  vi.spyOn(api, 'executions').mockResolvedValue({
+    conversation_id: 'conv-1',
+    total: records.length,
+    limit: 200,
+    offset: 0,
+    executions: records,
+  })
+  await useChatStore.getState().openConversation('conv-1')
+}
+
 beforeEach(() => {
+  vi.restoreAllMocks()
   useToastStore.setState({ items: [] })
   useChatStore.setState({
     conversations: [],
@@ -180,6 +233,149 @@ describe('chat event ingestion', () => {
     expect(state.taskStatus).toBe('failed')
     expect(state.error).toBe('No model configured')
     expect(state.errorHint).toBe('Open Settings → AI Models')
+  })
+})
+
+describe('persisted tool history', () => {
+  it('rehydrates a terminal execution onto its assistant message', async () => {
+    await loadConversation([execution()])
+
+    const state = useChatStore.getState()
+    expect(state.messages).toHaveLength(1)
+    expect(state.messages[0].tools).toHaveLength(1)
+    expect(state.messages[0].tools?.[0]).toMatchObject({
+      id: 'exe-1',
+      tool: 'files.read_file',
+      status: 'succeeded',
+      verified: true,
+      evidence: 'read 12 bytes',
+      permission: 'read',
+    })
+  })
+
+  it('does not duplicate cards when the conversation is reopened', async () => {
+    await loadConversation([execution()])
+    await loadConversation([execution()])
+
+    const tools = useChatStore.getState().messages[0].tools ?? []
+    expect(tools).toHaveLength(1)
+    expect(tools[0].id).toBe('exe-1')
+  })
+
+  it('renders failed executions with their error', async () => {
+    await loadConversation([
+      execution({ status: 'failed', ok: false, verified: false, evidence: '', error: 'Access denied' }),
+    ])
+
+    const tool = useChatStore.getState().messages[0].tools?.[0]
+    expect(tool).toMatchObject({ status: 'failed', error: 'Access denied' })
+  })
+
+  it('seeds open executions into the live tool list without duplicating them', async () => {
+    await loadConversation([execution({ status: 'running', completed_at: null })])
+
+    const state = useChatStore.getState()
+    expect(state.messages[0].tools ?? []).toHaveLength(0)
+    expect(state.toolEvents).toHaveLength(1)
+    expect(state.toolEvents[0]).toMatchObject({ id: 'exe-1', status: 'running' })
+    expect(state.activeTaskId).toBe('task-1')
+    expect(state.sending).toBe(true)
+  })
+
+  it('shows pending approval state from persisted history', async () => {
+    await loadConversation([
+      execution({ status: 'pending_approval', completed_at: null, approval_status: 'pending' }),
+    ])
+
+    const tool = useChatStore.getState().toolEvents[0]
+    expect(tool).toMatchObject({ status: 'running', approvalStatus: 'pending' })
+  })
+
+  it('reconciles live events by execution id instead of creating duplicates', () => {
+    useChatStore.setState({ activeTaskId: 'task-1' })
+    useChatStore.getState().ingestEvent(
+      event('tool.started', {
+        task_id: 'task-1',
+        execution_id: 'exe-live',
+        step: 1,
+        tool: 'files.read_file',
+        arguments: { path: 'a.txt' },
+        permission: 'read',
+      }),
+    )
+    useChatStore.getState().ingestEvent(
+      event('tool.completed', {
+        task_id: 'task-1',
+        execution_id: 'exe-live',
+        step: 1,
+        tool: 'files.read_file',
+        status: 'completed',
+        ok: true,
+        verified: true,
+        evidence: 'read 12 bytes',
+        duration_ms: 42,
+      }),
+    )
+
+    const tools = useChatStore.getState().toolEvents
+    expect(tools).toHaveLength(1)
+    expect(tools[0]).toMatchObject({
+      id: 'exe-live',
+      status: 'succeeded',
+      verified: true,
+      evidence: 'read 12 bytes',
+    })
+  })
+
+  it('tracks approval status changes and resolution', () => {
+    useChatStore.setState({ activeTaskId: 'task-1' })
+    useChatStore.getState().ingestEvent(
+      event('tool.started', {
+        task_id: 'task-1',
+        execution_id: 'exe-approval',
+        step: 1,
+        tool: 'files.delete',
+        arguments: { path: 'a.txt' },
+        permission: 'write',
+      }),
+    )
+    useChatStore.getState().ingestEvent(
+      event('tool.status', {
+        task_id: 'task-1',
+        execution_id: 'exe-approval',
+        status: 'pending_approval',
+        tool: 'files.delete',
+      }),
+    )
+    expect(useChatStore.getState().toolEvents[0]).toMatchObject({
+      status: 'running',
+      approvalStatus: 'pending',
+    })
+
+    useChatStore.getState().ingestEvent(
+      event('approval.resolved', {
+        task_id: 'task-1',
+        approval_id: 'apr-1',
+        approved: false,
+        reason: 'user',
+      }),
+    )
+    expect(useChatStore.getState().toolEvents[0]).toMatchObject({
+      status: 'running',
+      approvalStatus: 'denied',
+    })
+  })
+
+  it('keeps legacy histories without task ids visible', async () => {
+    await loadConversation(
+      [execution({ task_id: 'task-legacy' })],
+      [message({ task_id: null, content: 'Older message' })],
+    )
+
+    const messages = useChatStore.getState().messages
+    const withTools = messages.filter((item) => (item.tools ?? []).length > 0)
+    expect(withTools).toHaveLength(1)
+    expect(withTools[0].tools?.[0].id).toBe('exe-1')
   })
 })
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from typing import Any
 
@@ -15,9 +16,22 @@ from app.providers.base import ChatMessage, LLMProvider, ModelInfo, ProviderResp
 class OllamaProvider(LLMProvider):
     name = "ollama"
 
-    def __init__(self, *, base_url: str, model: str) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        think: bool | None = None,
+        keep_alive: str | int | None = None,
+        num_ctx: int | None = None,
+    ) -> None:
         self.base_url = (base_url or "http://127.0.0.1:11434").rstrip("/")
         self.model = model
+        # ``None`` leaves the model's own default intact; thinking is never
+        # disabled implicitly.
+        self.think = think
+        self.keep_alive = keep_alive
+        self.num_ctx = num_ctx
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(240.0, connect=15.0))
 
     def _message_payload(self, message: ChatMessage) -> dict[str, Any]:
@@ -28,7 +42,40 @@ class OllamaProvider(LLMProvider):
             ]
         if message.role == "tool":
             data["role"] = "tool"
+            # Ollama associates a tool result with its originating call by name.
+            # Without this the model can re-issue the same call indefinitely.
+            if message.name:
+                data["tool_name"] = message.name
         return data
+
+    def _request_payload(
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None,
+        temperature: float,
+        *,
+        think: bool | None = None,
+        json_mode: bool = False,
+    ) -> dict[str, Any]:
+        options: dict[str, Any] = {"temperature": temperature}
+        if self.num_ctx:
+            options["num_ctx"] = self.num_ctx
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [self._message_payload(message) for message in messages],
+            "stream": True,
+            "options": options,
+        }
+        effective_think = self.think if think is None else think
+        if effective_think is not None:
+            payload["think"] = effective_think
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
+        if json_mode:
+            payload["format"] = "json"
+        if tools:
+            payload["tools"] = tools
+        return payload
 
     async def chat(
         self,
@@ -37,21 +84,20 @@ class OllamaProvider(LLMProvider):
         *,
         temperature: float = 0.2,
         on_text: TextCallback | None = None,
+        think: bool | None = None,
+        json_mode: bool = False,
     ) -> ProviderResponse:
         if not self.model:
             raise ConfigurationError(
                 "No Ollama model is configured.",
                 hint="Start Ollama, pull a model, then select it in Settings → AI Provider.",
             )
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [self._message_payload(message) for message in messages],
-            "stream": True,
-            "options": {"temperature": temperature},
-        }
-        if tools:
-            payload["tools"] = tools
+        payload = self._request_payload(
+            messages, tools, temperature, think=think, json_mode=json_mode
+        )
 
+        started = time.perf_counter()
+        first_token_ms: float | None = None
         content_parts: list[str] = []
         calls: list[ToolCall] = []
         finish_reason = "stop"
@@ -77,6 +123,9 @@ class OllamaProvider(LLMProvider):
                         raise ProviderError(f"Ollama error: {chunk['error']}")
                     message = chunk.get("message") or {}
                     text = message.get("content") or ""
+                    thinking = message.get("thinking") or ""
+                    if (text or thinking) and first_token_ms is None:
+                        first_token_ms = (time.perf_counter() - started) * 1000
                     if text:
                         content_parts.append(text)
                         if on_text:
@@ -105,6 +154,10 @@ class OllamaProvider(LLMProvider):
                                 "prompt_tokens": chunk.get("prompt_eval_count", 0),
                                 "completion_tokens": chunk.get("eval_count", 0),
                             }
+                        usage.update(self._timing_metrics(chunk))
+                        usage["total_ms"] = round((time.perf_counter() - started) * 1000, 1)
+                        if first_token_ms is not None:
+                            usage["first_token_ms"] = round(first_token_ms, 1)
         except httpx.ConnectError as exc:
             raise ProviderError(
                 f"Ollama is not reachable at {self.base_url}.",
@@ -121,6 +174,29 @@ class OllamaProvider(LLMProvider):
             usage=usage,
             model=self.model,
         )
+
+    @staticmethod
+    def _timing_metrics(chunk: dict[str, Any]) -> dict[str, Any]:
+        """Normalize Ollama's nanosecond timings into report-friendly metrics."""
+        metrics: dict[str, Any] = {}
+        for key, name in (
+            ("total_duration", "total_duration_ms"),
+            ("load_duration", "load_duration_ms"),
+            ("prompt_eval_duration", "prompt_eval_duration_ms"),
+            ("eval_duration", "eval_duration_ms"),
+        ):
+            value = chunk.get(key)
+            if isinstance(value, (int, float)):
+                metrics[name] = round(value / 1_000_000, 1)
+        eval_count = chunk.get("eval_count")
+        eval_duration = chunk.get("eval_duration")
+        if (
+            isinstance(eval_count, (int, float))
+            and isinstance(eval_duration, (int, float))
+            and eval_duration > 0
+        ):
+            metrics["tokens_per_second"] = round(eval_count / (eval_duration / 1_000_000_000), 2)
+        return metrics
 
     async def list_models(self) -> list[ModelInfo]:
         try:
